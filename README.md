@@ -61,11 +61,11 @@ Create or expand cloud identity/access only with the operator's specific approva
 
 ## Validação externa e publicação
 
-Uma implantação autorizada demonstrou troca autenticada nos dois sentidos, resposta persistida e despertar nativo do cliente por `message.received`. Essa evidência complementa os testes locais e não certifica outras instalações. A renovação contínua da assinatura ainda não foi observada empiricamente. Veja os [limites da validação](docs/architecture.md#limites-da-validação) e o [procedimento de verificação nativa](docs/deployment.md#verificação-nativa-do-cliente).
+Uma implantação autorizada demonstrou troca autenticada nos dois sentidos, resposta persistida e despertar nativo do cliente por `message.received`. Essa evidência complementa os testes locais e não certifica outras instalações. A continuidade prolongada da assinatura permanece não comprovada. Veja os [limites da validação](docs/architecture.md#limites-da-validação) e o [procedimento de verificação nativa](docs/deployment.md#verificação-nativa-do-cliente).
 
-O ACK está implementado e coberto por testes locais. A prova externa anterior usou uma versão sem ACK e observou reentrega de resposta terminal. As dependências foram atualizadas no candidato local; o novo pacote, a implantação e o uso do ACK pelas rotinas precisam de evidências próprias. Esses resultados locais não confirmam sua ativação no serviço existente.
+Uma implantação autorizada demonstrou despertar nativo, resposta automática e confirmação terminal por ACK. O claim terminou como `done / acknowledged`, sem publicar outra resposta, e a entrega pendente foi encerrada. Também foi observada renovação nativa da assinatura; a continuidade prolongada permanece não comprovada, sem SLA ou continuidade indefinida estabelecidos.
 
-A publicação futura exige revisar também o histórico Git e os artefatos, decidir a licença e concluir a conciliação entre fonte e implantação. O [guia de publicação](docs/publication.md) separa essas decisões da ativação do CD. Registros da instalação e conversas reais permanecem fora do repositório.
+A publicação futura exige revisar também o histórico Git e os artefatos, decidir a licença e preservar a rastreabilidade entre fonte e implantação. O [guia de publicação](docs/publication.md) separa essas decisões da ativação do CD. Registros da instalação e conversas reais permanecem fora do repositório.
 
 ## Known operational limits
 
