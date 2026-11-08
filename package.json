@@ -2,6 +2,11 @@
   "name": "agent-message-bridge",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/renanwilliam/agent-message-bridge.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=24"

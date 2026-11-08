@@ -55,7 +55,7 @@ Use [the deployment guide](docs/deployment.md) and [architecture notes](docs/arc
 
 A delivery route may set `additionalAuthHeader`, for example `"X-Webhook-Key"`, when its receiver requires a second credential header. Webhook requests then send the same raw `bearer` value in that header while retaining `Authorization: Bearer …`; the option is absent by default and never applies to MCP Events. Names must be ASCII `X-` names with letters, digits and single hyphen separators, at most 64 characters. Routing, protocol and trace names are reserved. Header names are emitted lowercase. Keep this setting with the approved private route; do not duplicate credentials in message bodies or MCP configuration.
 
-Create or expand cloud identity/access only with the operator's specific approval. Packaging is not deployment. No public publication or license selection is implied by this repository.
+Criar ou ampliar identidades e acessos na nuvem exige aprovação específica do operador. Empacotar não equivale a implantar. A licença do código não concede acesso à infraestrutura de nenhuma instalação.
 
 [CI and production CD](docs/ci-cd.md) are prepared for `master` and a single production environment. CI runs local checks; automatic deployment stays disabled until separately approved. The prepared CD preserves live infrastructure and authentication, updates existing Lambda code only, and tracks each first-parent master commit from a reviewed private baseline. No remote test environment is created.
 
@@ -65,7 +65,11 @@ Uma implantação autorizada demonstrou troca autenticada nos dois sentidos, res
 
 Uma implantação autorizada demonstrou despertar nativo, resposta automática e confirmação terminal por ACK. O claim terminou como `done / acknowledged`, sem publicar outra resposta, e a entrega pendente foi encerrada. Também foi observada renovação nativa da assinatura; a continuidade prolongada permanece não comprovada, sem SLA ou continuidade indefinida estabelecidos.
 
-A publicação futura exige revisar também o histórico Git e os artefatos, decidir a licença e preservar a rastreabilidade entre fonte e implantação. O [guia de publicação](docs/publication.md) separa essas decisões da ativação do CD. Registros da instalação e conversas reais permanecem fora do repositório.
+A publicação e a manutenção do projeto exigem revisar também o histórico Git e os artefatos e preservar a rastreabilidade entre fonte e implantação. O [guia de publicação](docs/publication.md) separa essa revisão da ativação do CD. Registros da instalação e conversas reais permanecem fora do repositório.
+
+## Licença
+
+O código deste projeto é distribuído sob a [licença MIT](LICENSE). As dependências mantêm suas próprias licenças e condições de uso, incluindo as do Serverless Framework; esta licença não as substitui.
 
 ## Known operational limits
 
