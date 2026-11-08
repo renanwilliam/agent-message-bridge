@@ -155,6 +155,15 @@ export function awsErrorCode(stderr) {
     (code === 'ValidationError' && details.includes('does not exist')) ? 'NotFound' : code;
 }
 
+export function createImmutableObject(create, readVerifiedExisting) {
+  try { return create(); }
+  catch (error) {
+    // Só 412 comprova a colisão da escrita condicional. Não repetir mutação após erro incerto.
+    if (!['PreconditionFailed', '412'].includes(error.code)) throw error;
+    return readVerifiedExisting();
+  }
+}
+
 function run(command, args, cwd, env = process.env) {
   try { return execFileSync(command, args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 }); }
   catch (cause) {
@@ -191,12 +200,11 @@ async function main() {
   };
   const put = (key, file, condition = ['--if-none-match', '*']) => aws('s3api', 'put-object', '--bucket', config.artifactBucket, '--key', key, '--body', file, '--server-side-encryption', 'AES256', ...condition);
   const immutableJson = (key, value) => {
-    try {
+    const response = createImmutableObject(() => put(key, save(`write-${digest(key)}.json`, value)), () => {
       const existing = getObject(config.artifactBucket, key);
       ensure(same(existing.value, value) && validObjectVersion(existing.version), 'Immutable JSON content/version mismatch');
-      return existing.version;
-    } catch (error) { if (error.code !== 'NotFound') throw error; }
-    const response = put(key, save(`write-${digest(key)}.json`, value));
+      return { VersionId: existing.version };
+    });
     ensure(validObjectVersion(response.VersionId), 'Immutable JSON version missing');
     return response.VersionId;
   };
@@ -358,11 +366,12 @@ async function main() {
         assertPackageCompatibility(live, packaged);
         for (const [id, file] of Object.entries(files)) {
           const key = `${prefix}/${file.name}`;
-          // A retry can encounter an existing immutable key; verify its checksum first.
-          let uploaded;
-          try { uploaded = aws('s3api', 'head-object', '--bucket', config.artifactBucket, '--key', key); } catch (error) { if (error.code !== 'NotFound') throw error; }
-          if (uploaded) ensure(uploaded.Metadata?.sha256 === file.sha256 && validObjectVersion(uploaded.VersionId), 'Existing artifact digest/version mismatch');
-          else uploaded = put(key, file.path, ['--if-none-match', '*', '--metadata', `sha256=${file.sha256}`]);
+          // A escrita condicional dispensa ListBucket para distinguir objeto ausente de acesso negado.
+          const uploaded = createImmutableObject(() => put(key, file.path, ['--if-none-match', '*', '--metadata', `sha256=${file.sha256}`]), () => {
+            const existing = aws('s3api', 'head-object', '--bucket', config.artifactBucket, '--key', key);
+            ensure(existing.Metadata?.sha256 === file.sha256 && validObjectVersion(existing.VersionId), 'Existing artifact digest/version mismatch');
+            return existing;
+          });
           ensure(validObjectVersion(uploaded.VersionId), 'Artifact version missing');
           codes[id] = { S3Bucket: config.artifactBucket, S3Key: key, S3ObjectVersion: uploaded.VersionId };
         }

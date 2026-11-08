@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
 
 const scriptUrl = new URL('../scripts/ci-deploy.mjs', import.meta.url).href;
-const { assertCodeOnly, codeOnlyTemplate, assertSafeChangeSet, pendingOutcome, commitsAfterBaseline, validateConfig, digest, awsErrorCode, serializePackageConfig, validObjectVersion, describeChangeSetArgs, assertReleaseManifest, assertDeployedCode } = await import(scriptUrl);
+const { assertCodeOnly, codeOnlyTemplate, assertSafeChangeSet, pendingOutcome, commitsAfterBaseline, validateConfig, digest, awsErrorCode, serializePackageConfig, validObjectVersion, describeChangeSetArgs, assertReleaseManifest, assertDeployedCode, createImmutableObject } = await import(scriptUrl);
 type Obj = Record<string, any>;
 const roleIds = ['McpRole', 'IngressRole', 'HistoryRole', 'StreamRole', 'DeliveryRole', 'SweepRole', 'RecoveryScheduleRole'];
 function template(): Obj {
@@ -139,6 +139,68 @@ process.stdout.write(JSON.stringify(output));
     const recoveryResult = execute(resumed);
     assert.equal(recoveryResult.status, 1); assert.match(recoveryResult.stderr, /deployed code differs/);
     assert.match(recoveryResult.calls, /describe-change-set/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('CD cria objeto imutável antes de ler; só colisão 412 permite verificar existente', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'bridge-cd-put-first-'));
+  const fixturePath = join(directory, 'fixture.json');
+  const callsPath = join(directory, 'calls.txt');
+  try {
+    // CLI local sintético: toda chamada é registrada; nenhum comando toca rede ou credenciais.
+    const cliPath = join(directory, 'synthetic-aws.cjs');
+    writeFileSync(cliPath, `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const fixture = JSON.parse(fs.readFileSync(process.env.CD_FIXTURE, 'utf8'));
+const operation = args[1];
+fs.appendFileSync(process.env.CD_CALLS, operation + '\\n');
+if (operation === 'put-object') {
+  if (args[args.indexOf('--if-none-match') + 1] !== '*') throw Error('Conditional header required');
+  if (fixture.putError) {
+    process.stderr.write(fixture.putError === 'unknown' ? 'Connection timed out; outcome unknown' : 'An error occurred (' + fixture.putError + ') when calling the PutObject operation');
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify({ VersionId: 'createdVersion-123' }));
+} else if (operation === 'get-object') {
+  if (fixture.readError) {
+    process.stderr.write('An error occurred (AccessDenied) when calling the GetObject operation');
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify({ VersionId: 'existingVersion-123', content: fixture.content }));
+} else throw Error('Unexpected operation');
+`);
+    const cli = (...args: string[]) => {
+      try {
+        return JSON.parse(execFileSync(process.execPath, [cliPath, 's3api', ...args], { encoding: 'utf8', env: { CD_FIXTURE: fixturePath, CD_CALLS: callsPath }, stdio: ['ignore', 'pipe', 'pipe'] }));
+      } catch (cause: any) {
+        const error: any = new Error('synthetic CLI failure'); error.code = awsErrorCode(cause.stderr); throw error;
+      }
+    };
+    const execute = (fixture: Obj) => {
+      writeFileSync(fixturePath, JSON.stringify(fixture)); writeFileSync(callsPath, '');
+      return () => createImmutableObject(() => cli('put-object', '--if-none-match', '*'), () => {
+        const existing = cli('get-object');
+        assert.equal(existing.content, 'reviewed synthetic content', 'existing content mismatch');
+        assert.ok(validObjectVersion(existing.VersionId));
+        return existing;
+      });
+    };
+    const calls = () => readFileSync(callsPath, 'utf8').trim().split('\n');
+    assert.equal(execute({})().VersionId, 'createdVersion-123');
+    assert.deepEqual(calls(), ['put-object']);
+    for (const putError of ['PreconditionFailed', '412']) {
+      assert.equal(execute({ putError, content: 'reviewed synthetic content' })().VersionId, 'existingVersion-123');
+      assert.deepEqual(calls(), ['put-object', 'get-object']);
+    }
+    assert.throws(execute({ putError: 'PreconditionFailed', content: 'divergent content' }), /content mismatch/);
+    assert.deepEqual(calls(), ['put-object', 'get-object']);
+    for (const putError of ['AccessDenied', '403', 'ConditionalRequestConflict', '409', 'unknown']) {
+      assert.throws(execute({ putError }), /synthetic CLI failure/);
+      assert.deepEqual(calls(), ['put-object'], '403, conflito e resultado incerto não autorizam ler ou repetir a mutação');
+    }
+    assert.throws(execute({ putError: 'PreconditionFailed', readError: true }), /synthetic CLI failure/);
+    assert.deepEqual(calls(), ['put-object', 'get-object']);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 

@@ -174,6 +174,12 @@ objects or deployments, and does not establish that OIDC or rollback works live.
 ## Recovery and rollback
 
 Artifacts, templates and manifests use immutable keys plus S3 version IDs.
+The script first attempts each immutable upload with `If-None-Match: *`. Only a
+confirmed `PreconditionFailed`/HTTP 412 response permits reading and verifying an
+existing object. Access denial, HTTP 409, network uncertainty and other errors
+stop the run without automatically retrying the mutation. This avoids requiring
+bucket-wide `s3:ListBucket` access to distinguish a missing object from a denied
+GET/HEAD. Required configuration and state reads still fail closed when unavailable.
 Existing objects must match the expected digest/version. State writes use ETag
 conditions; a concurrent change stops the run. Before creating a change set, the
 script durably records its commit, manifest key **and version**, template digest, deterministic name
@@ -219,6 +225,8 @@ gating. A synthetic CLI test also runs the actual script with no AWS credentials
 or network, including an already-current baseline, missing manifest versions,
 corrupted stored ZIP bytes, out-of-band deployed-code drift, and recovery after
 CloudFormation completion that must not advance state on a hash mismatch.
+Conditional-upload CLI tests cover first creation, identical/divergent collisions,
+denied reads and writes, and uncertain/conflicting results without mutation retries.
 These tests do not yet simulate every cross-service interruption between S3 and
 CloudFormation. No GitHub-hosted deployment, OIDC exchange, service-role policy,
 versioned baseline or real rollback has been exercised by adding this pipeline.

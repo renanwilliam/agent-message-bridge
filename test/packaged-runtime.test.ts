@@ -72,6 +72,8 @@ async function wrapperFromZip(archive:string):Promise<Buffer> {
 async function isolatedSmoke(program:string) {
   for(const file of buildFiles) assert(existsSync(join(buildDirectory,file)),`Incomplete generated build: ${file}`);
   const template=JSON.parse(await readFile(join(packageDirectory,'cloudformation-template-update-stack.json'),'utf8'));
+  assert.equal(template.Resources?.BridgeLambdaFunction?.Properties?.Handler,'serverless-mcp/entry.handler',
+    'O smoke deve exercitar o handler realmente configurado no pacote');
   const artifactKey:unknown=template.Resources?.BridgeLambdaFunction?.Properties?.Code?.S3Key;
   assert.equal(typeof artifactKey,'string','Generated MCP archive key must be explicit');
   const artifactName=basename(artifactKey as string);
@@ -105,15 +107,35 @@ assert.deepEqual(JSON.parse(Buffer.from(response.body,response.isBase64Encoded?'
  {error:'integration_not_configured',status:'infrastructure_only'});
 console.log('packaged-bootstrap-ok');
 `;
-test('packaged MCP wrapper imports with plain Node and serves bootstrap without node_modules',{skip:!hasBuild},async()=>{
+test('packaged MCP streaming handler imports with plain Node and serves bootstrap without node_modules',{skip:!hasBuild},async()=>{
   await isolatedSmoke(`
 import assert from 'node:assert/strict';
-globalThis.awslambda={streamifyResponse:handler=>handler};
+import { Writable } from 'node:stream';
+import { finished } from 'node:stream/promises';
+const chunks=[];
+const responseStream=new Writable({write(chunk,encoding,callback){chunks.push(Buffer.from(chunk));callback();}});
+const streamingMarker=Symbol('runtime-streaming-marker');
+let metadata;
+let metadataCalls=0;
+globalThis.awslambda={
+ streamifyResponse:handler=>Object.defineProperty(handler,streamingMarker,{value:true,enumerable:false}),
+ HttpResponseStream:{from(stream,value){
+  assert.equal(stream,responseStream);
+  metadata=value;
+  metadataCalls++;
+  return stream;
+ }},
+};
 const entry=await import('./serverless-mcp/entry.mjs');
 assert.equal(typeof entry.handler,'function');
-assert.equal(typeof entry.bufferedHandler,'function');
-const response=await entry.bufferedHandler({path:'/bridge/mcp',httpMethod:'GET',headers:{host:'bridge.example.test'},
- requestContext:{stage:'example',identity:{sourceIp:'127.0.0.1'}},body:null,isBase64Encoded:false},{});
+assert.equal(entry.handler[streamingMarker],true);
+await entry.handler({path:'/bridge/mcp',httpMethod:'GET',headers:{host:'bridge.example.test'},
+ requestContext:{stage:'example',identity:{sourceIp:'127.0.0.1'}},body:null,isBase64Encoded:false},responseStream,{});
+await finished(responseStream);
+assert.equal(metadataCalls,1);
+assert.equal(responseStream.writableFinished,true);
+assert.match(metadata.headers['content-type'],new RegExp('^application/json(?:;|$)'));
+const response={statusCode:metadata.statusCode,body:Buffer.concat(chunks).toString('utf8'),isBase64Encoded:false};
 ${responseCheck}`);
 });
 test('packaged AWS handlers import with plain Node and history serves bootstrap without node_modules',{skip:!hasBuild},async()=>{
