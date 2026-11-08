@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync, readdirSync } from 'n
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { parse, stringify } from 'yaml';
+import { parseDocument, stringify } from 'yaml';
 
 const shaPattern = /^[a-f0-9]{40}$/;
 const checksumPattern = /^[a-f0-9]{64}$/;
@@ -22,7 +22,18 @@ export const digest = value => createHash('sha256').update(typeof value === 'str
 // Serverless can read YAML with 1.1 timestamp coercion. Preserve IAM policy
 // versions and every other string when emitting our temporary configuration.
 export const serializePackageConfig = value => stringify(value, { defaultStringType: 'QUOTE_DOUBLE' });
-const ensure = (condition, message) => { if (!condition) throw new Error(message); };
+class PublicCdError extends Error {}
+const ensure = (condition, message) => { if (!condition) throw new PublicCdError(message); };
+// Só erros controlados deste módulo podem expor diagnóstico; erros de parsers/FS ficam genéricos.
+export const publicFailureMessage = error => error instanceof PublicCdError
+  ? error.message
+  : 'Production deployment failed; private diagnostics suppressed. Inspect the private service state before retrying.';
+export function parseDeploymentYaml(source) {
+  // Warnings do parser também podem conter valores: rejeitar sem emitir trechos do documento.
+  const document = parseDocument(source, { logLevel: 'silent', prettyErrors: false });
+  ensure(document.errors.length === 0 && document.warnings.length === 0, 'Deployment YAML is invalid or uses unsupported tags');
+  return document.toJS();
+}
 const same = (a, b) => canonical(a) === canonical(b);
 const lambdas = template => Object.entries(template.Resources ?? {}).filter(([, resource]) => resource.Type === 'AWS::Lambda::Function');
 // S3 version IDs are opaque UTF-8 strings, at most 1,024 bytes. Do not assume
@@ -52,8 +63,8 @@ export function assertReleaseManifest(release, manifest, template) {
   ensure(ids.length > 0 && same(ids, Object.keys(manifest.artifacts ?? {}).sort()) &&
     same(ids, Object.keys(manifest.checksums ?? {}).sort()), 'Manifest Lambda artifact/checksum set mismatch');
   for (const id of ids) {
-    ensure(validCode(manifest.artifacts[id]) && same(template.Resources[id].Properties.Code, manifest.artifacts[id]), `${id}: immutable artifact differs from template`);
-    ensure(checksumPattern.test(manifest.checksums[id] ?? ''), `${id}: invalid artifact checksum`);
+    ensure(validCode(manifest.artifacts[id]) && same(template.Resources[id].Properties.Code, manifest.artifacts[id]), 'Lambda immutable artifact differs from template');
+    ensure(checksumPattern.test(manifest.checksums[id] ?? ''), 'Invalid Lambda artifact checksum');
   }
 }
 
@@ -62,9 +73,9 @@ export function assertDeployedCode(manifest, deployed) {
   ensure(same(ids, Object.keys(deployed).sort()), 'Deployed Lambda set differs from the reviewed manifest');
   for (const id of ids) {
     const actual = deployed[id];
-    ensure(actual?.State === 'Active' && actual.LastUpdateStatus === 'Successful', `${id}: Lambda is not ready for release verification`);
+    ensure(actual?.State === 'Active' && actual.LastUpdateStatus === 'Successful', 'Lambda is not ready for release verification');
     const expected = Buffer.from(manifest.checksums[id], 'hex').toString('base64');
-    ensure(actual.CodeSha256 === expected, `${id}: deployed code differs from the reviewed artifact`);
+    ensure(actual.CodeSha256 === expected, 'Lambda deployed code differs from the reviewed artifact');
   }
 }
 
@@ -91,7 +102,7 @@ function assertPackageCompatibility(live, packaged) {
   ensure(roleIds.every(id => live.Resources[id]?.Type === 'AWS::IAM::Role'), 'Approved runtime role set missing');
   for (const [id, resource] of lambdas(live)) {
     const next = packaged.Resources[id];
-    for (const key of ['Handler', 'Runtime', 'Architectures', 'PackageType']) ensure(same(resource.Properties[key], next.Properties[key]), `${id}: runtime/handler change requires infrastructure approval`);
+    for (const key of ['Handler', 'Runtime', 'Architectures', 'PackageType']) ensure(same(resource.Properties[key], next.Properties[key]), 'Lambda runtime/handler change requires infrastructure approval');
   }
   return actualIds;
 }
@@ -145,7 +156,7 @@ export function pendingOutcome(state, stack, templateDigest, changeSet) {
   if (stack.StackStatus.endsWith('_IN_PROGRESS')) return 'wait';
   if (stack.StackStatus === 'UPDATE_COMPLETE' && templateDigest === state.pending.templateDigest) return 'commit';
   if (stableStatuses.has(stack.StackStatus) && templateDigest === state.templateDigest && changeSet.ExecutionStatus === 'AVAILABLE') return 'execute';
-  throw new Error('Pending release requires reconciliation: preserve the state and inspect CloudFormation before any retry');
+  throw new PublicCdError('Pending release requires reconciliation: preserve the state and inspect CloudFormation before any retry');
 }
 
 export function awsErrorCode(stderr) {
@@ -167,7 +178,7 @@ export function createImmutableObject(create, readVerifiedExisting) {
 function run(command, args, cwd, env = process.env) {
   try { return execFileSync(command, args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 }); }
   catch (cause) {
-    const error = new Error(`${basename(command)} operation failed; sensitive output suppressed. Inspect the private service state before retrying.`);
+    const error = new PublicCdError(`${basename(command)} operation failed; sensitive output suppressed. Inspect the private service state before retrying.`);
     error.code = awsErrorCode(cause.stderr);
     throw error;
   }
@@ -211,7 +222,7 @@ async function main() {
   const readState = () => getObject(config.artifactBucket, config.stateKey);
   const writeState = (state, etag) => { ensure(etag, 'State ETag required'); put(config.stateKey, save('state.json', state), ['--if-match', etag]); return readState(); };
   const stackNow = () => aws('cloudformation', 'describe-stacks', '--stack-name', config.stackName).Stacks[0];
-  const templateNow = () => { const value = aws('cloudformation', 'get-template', '--stack-name', config.stackName, '--template-stage', 'Original').TemplateBody; return typeof value === 'string' ? parse(value) : value; };
+  const templateNow = () => { const value = aws('cloudformation', 'get-template', '--stack-name', config.stackName, '--template-stage', 'Original').TemplateBody; return typeof value === 'string' ? parseDeploymentYaml(value) : value; };
   const describeChangeSet = id => aws(...describeChangeSetArgs(config.stackName, id));
   const verifiedArtifacts = new Set();
   const verifyStoredArtifacts = manifest => {
@@ -222,7 +233,7 @@ async function main() {
       const path = join(temp, `artifact-${identity}.zip`);
       try {
         const object = aws('s3api', 'get-object', '--bucket', code.S3Bucket, '--key', code.S3Key, '--version-id', code.S3ObjectVersion, path);
-        ensure(object.VersionId === code.S3ObjectVersion && digest(readFileSync(path)) === expected, `${id}: stored artifact checksum/version mismatch`);
+        ensure(object.VersionId === code.S3ObjectVersion && digest(readFileSync(path)) === expected, 'Lambda stored artifact checksum/version mismatch');
         verifiedArtifacts.add(identity);
       } finally { rmSync(path, { force: true }); }
     }
@@ -263,7 +274,7 @@ async function main() {
   };
   const poll = async (read, ready, label) => {
     for (let count = 0; count < 160; count++) { const value = read(); if (ready(value)) return value; await new Promise(resolve => setTimeout(resolve, 15_000)); }
-    throw new Error(`${label} still pending: check service state before retrying`);
+    throw new PublicCdError(`${label} still pending: check service state before retrying`);
   };
   const reconcile = async record => {
     let state = record.value;
@@ -295,7 +306,7 @@ async function main() {
       assertCodeOnly(verifyBaseline(state), candidate);
       assertSafeChangeSet(changeSet, lambdas(candidate).map(([id]) => id));
       const reviewedBody = aws('cloudformation', 'get-template', '--stack-name', config.stackName, '--change-set-name', pending.changeSetId, '--template-stage', 'Original').TemplateBody;
-      ensure(digest(typeof reviewedBody === 'string' ? parse(reviewedBody) : reviewedBody) === pending.templateDigest, 'Change-set template differs from the reviewed artifact');
+      ensure(digest(typeof reviewedBody === 'string' ? parseDeploymentYaml(reviewedBody) : reviewedBody) === pending.templateDigest, 'Change-set template differs from the reviewed artifact');
       // The reviewed ARN and client token survive job retries. Never create a new set here.
       aws('cloudformation', 'execute-change-set', '--change-set-name', pending.changeSetId, '--client-request-token', pending.token, '--no-disable-rollback');
       outcome = 'wait';
@@ -306,7 +317,7 @@ async function main() {
         if (value.StackStatus === 'UPDATE_COMPLETE' && digest(templateNow()) === pending.templateDigest) return true;
         // Immediately after ExecuteChangeSet, the previous completed state can
         // still be visible. Rollback/failure states must not be retried blindly.
-        if (!['CREATE_COMPLETE', 'UPDATE_COMPLETE'].includes(value.StackStatus)) throw new Error('CloudFormation update failed or rolled back; inspect the pending release before retrying');
+        if (!['CREATE_COMPLETE', 'UPDATE_COMPLETE'].includes(value.StackStatus)) throw new PublicCdError('CloudFormation update failed or rolled back; inspect the pending release before retrying');
         return false;
       }, 'Stack update');
       changeSet = describeChangeSet(pending.changeSetId);
@@ -342,7 +353,7 @@ async function main() {
         run('npm', ['ci', '--ignore-scripts'], source);
         run('npm', ['run', 'check'], source);
         run('npm', ['run', 'demo'], source);
-        const service = parse(readFileSync(join(source, 'serverless.yml'), 'utf8'));
+        const service = parseDeploymentYaml(readFileSync(join(source, 'serverless.yml'), 'utf8'));
         service.provider.deploymentBucket = { name: config.artifactBucket };
         service.package.patterns = [...(service.package.patterns ?? []), '!serverless.ci.yml'];
         // A configured existing bucket avoids Serverless's managed bucket/SSM bootstrap.
@@ -393,4 +404,4 @@ async function main() {
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main().catch(error => { console.error(error.message); process.exitCode = 1; });
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main().catch(error => { console.error(publicFailureMessage(error)); process.exitCode = 1; });

@@ -67,8 +67,8 @@ Before enabling the flag, prepare and review each concrete target and permission
 | GitHub deployment role | Read the exact versioned private configuration; read/write the exact release and state S3 prefixes; inspect the selected stack/change sets, including `cloudformation:ListStackResources`; read `lambda:GetFunctionConfiguration` for only its six functions to verify deployed hashes; create and execute updates only for that stack; pass only the separate CloudFormation execution role. No IAM mutation or secret-value access. |
 | CloudFormation execution role | Assumed by CloudFormation; read the selected package versions and inspect/update code for only the six existing functions. No create/delete function, IAM mutation, runtime-role passing, configuration change or Secrets Manager access. Verify the final required read actions against the real stack before activation. |
 | Private artifact/configuration storage | Existing approved private bucket/prefix with versioning and all four S3 public-access blocks enabled. Any new bucket, policy, versioning change or access grant needs its own review. |
-| GitHub `production` environment | Pre-create with `master` restriction, required reviewers where supported and deliberate bypass settings. Protect `master` and workflow/deployment-script changes. |
-| GitHub variables and secret | References listed below; an approved Serverless authentication method if the existing licensing setup requires one. |
+| Ambiente `production` do GitHub | Criar previamente e restringir a `master`, sem aprovação manual por release no modo automático solicitado. Proteger e revisar o código, os workflows e os scripts de implantação antes de entrarem em `master`. |
+| Variáveis do GitHub e secrets do ambiente | Referências privadas no ambiente protegido `production`, além da região pública e da variável de ativação do repositório listadas abaixo; método de autenticação do Serverless aprovado, caso a licença existente o exija. |
 | Activation | Explicit approval to set repository variable `ENABLE_PRODUCTION_CD=true`. |
 
 These are **two additional deployment roles**, separate from the seven application
@@ -92,13 +92,53 @@ malicious code on `master`. Review and protect that code, and constrain the actu
 IAM roles independently of these JavaScript checks. Reviewers of production code
 must understand that it will execute under the six existing application roles.
 
+`id-token: write` vale para todo o job de implantação. A verificação de
+dependências, os testes e a demonstração podem solicitar um token OIDC antes da
+etapa `configure-aws-credentials` e obter credenciais AWS se a relação de confiança
+da role permitir. A ordem dessas etapas não isola o acesso às credenciais.
+Proteja todo o código executado por esse job e o ambiente de produção,
+independentemente da variável de ativação do workflow. Desabilitar
+`ENABLE_PRODUCTION_CD` impede esse job de executar; não revoga a relação de
+confiança IAM existente nem impede outro workflow aceito por ela de utilizá-la.
+Criar ou alterar esse acesso persistente continua exigindo aprovação específica.
+
 ## Private inputs and baseline
 
-Use repository variables `AWS_DEPLOY_ROLE_ARN`, `AWS_REGION`, `AWS_ACCOUNT_ID`,
-`BRIDGE_CD_CONFIG_URI`, and `BRIDGE_CD_CONFIG_VERSION`. The latter two identify an
-exact private S3 configuration object version. `SERVERLESS_ACCESS_KEY`, if needed,
-is a separately approved GitHub secret; no AWS access keys are stored in GitHub.
-Keep `ENABLE_PRODUCTION_CD` absent or `false` until activation is authorized.
+Armazene `AWS_DEPLOY_ROLE_ARN`, `AWS_DEPLOY_ROLE_ID`, `AWS_ACCOUNT_ID`,
+`BRIDGE_CD_CONFIG_URI` e `BRIDGE_CD_CONFIG_VERSION` como secrets no ambiente
+protegido `production`. Os dois últimos identificam a versão exata de um objeto
+privado de configuração no S3. Mantenha a região pública `AWS_REGION` e
+`ENABLE_PRODUCTION_CD` como variáveis do repositório; deixe a variável de ativação
+ausente ou com valor `false` até a ativação ser autorizada. Se necessário,
+`SERVERLESS_ACCESS_KEY` é um secret nesse ambiente com aprovação separada;
+nenhuma chave de acesso AWS fica armazenada no GitHub.
+
+Logs de um repositório público podem expor entradas de actions e variáveis de
+ambiente das etapas. As variáveis do repositório não recebem mascaramento
+automático; por isso, referências privadas da implantação não devem ficar nelas.
+O mascaramento de secrets protege valores correspondentes, mas não garante
+proteção para valores transformados, parciais ou derivados. O mascaramento do ID
+da conta pela action AWS não cobre todos os identificadores de roles ou locais de
+configuração. Revise mensagens de status das actions, saídas de scripts e qualquer
+upload de artefatos antes de ativar. Nunca imprima configuração privada nem trate
+o mascaramento como autorização para publicá-la.
+
+`AWS_DEPLOY_ROLE_ID` é um metadado privado de identidade, não uma credencial.
+Ele deve conter o `RoleId` real da role IAM indicada pelo `AWS_DEPLOY_ROLE_ARN`
+aprovado; obtenha e confira essa correspondência durante a configuração aprovada
+separadamente. Recriar uma role muda seu RoleId mesmo quando o ARN é reutilizado;
+por isso, atualize e revise esse secret antes de outra implantação. O workflow
+verifica a sintaxe, mas não consulta a correspondência real entre ARN e RoleId.
+
+A versão fixada da action AWS imprime um identificador da role assumida no STS
+durante a autenticação. Antes de executá-la, `mask-deployment-identity` valida o
+ARN e o RoleId fornecidos e registra máscaras para o RoleId e o nome da role
+derivado do ARN. Entradas ausentes ou inválidas interrompem o job antes dessa
+action, sem imprimir seus valores. O mascaramento do ID da conta permanece
+habilitado. Essas máscaras reduzem a exposição conhecida nos logs de status;
+não restringem código malicioso em `master`, não protegem todo valor transformado
+nem certificam saídas de depuração ou futuras versões de actions e plugins.
+Revise essas saídas novamente ao mudar as ferramentas de implantação.
 
 The JSON configuration accepted by `validateConfig` contains exactly:
 
@@ -111,6 +151,14 @@ These values are references and deployment metadata, never token values, subject
 grants or secret documents. Put them in private storage, not a public example or
 workflow artifact. The pipeline suppresses raw command failures and does not
 upload templates, manifests or configuration to GitHub artifacts.
+
+Em caso de falha, são impressas apenas mensagens de validação controladas, sem
+identificadores de recursos. Erros inesperados de JSON, sistema de arquivos ou
+bibliotecas geram uma mensagem genérica e um código de saída diferente de zero.
+A leitura de YAML desabilita trechos de diagnóstico e avisos; documentos
+malformados e tags não suportadas interrompem a implantação sem imprimir o
+conteúdo privado dos templates. Para diagnosticar, inspecione o estado privado do
+serviço; não habilite saída bruta em logs públicos para contornar esse limite.
 
 After a reviewed manual installation, initialize a private release manifest and
 state object for the exact deployed code commit. The state records

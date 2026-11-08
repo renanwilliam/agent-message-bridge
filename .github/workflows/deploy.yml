@@ -40,19 +40,36 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm run demo
+      - name: Mascarar identidade privada de implantação
+        id: mask-deployment-identity
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          AWS_DEPLOY_ROLE_ID: ${{ secrets.AWS_DEPLOY_ROLE_ID }}
+        run: |
+          node <<'NODE'
+          const arn = process.env.AWS_DEPLOY_ROLE_ARN ?? '';
+          const roleId = process.env.AWS_DEPLOY_ROLE_ID ?? '';
+          const role = /^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role\/((?:[\x21-\x7e]+\/)?)([A-Za-z0-9_+=,.@-]{1,64})$/.exec(arn);
+          if (!role || role[1].length > 511 || /[\r\n]/.test(arn + roleId) || !/^AROA[A-Z0-9]{17}$/.test(roleId)) {
+            console.error('Missing or invalid private deployment identity.');
+            process.exit(1);
+          }
+          const escape = value => value.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+          process.stdout.write(`::add-mask::${escape(roleId)}\n::add-mask::${escape(role[2])}\n`);
+          NODE
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
           mask-aws-account-id: true
           role-duration-seconds: 3600
           unset-current-credentials: true
       - name: Deploy verified commits to the existing production stack
         env:
           ENABLE_PRODUCTION_CD: ${{ vars.ENABLE_PRODUCTION_CD }}
-          BRIDGE_CD_CONFIG_URI: ${{ vars.BRIDGE_CD_CONFIG_URI }}
-          BRIDGE_CD_CONFIG_VERSION: ${{ vars.BRIDGE_CD_CONFIG_VERSION }}
+          BRIDGE_CD_CONFIG_URI: ${{ secrets.BRIDGE_CD_CONFIG_URI }}
+          BRIDGE_CD_CONFIG_VERSION: ${{ secrets.BRIDGE_CD_CONFIG_VERSION }}
           AWS_REGION: ${{ vars.AWS_REGION }}
           TARGET_SHA: ${{ github.sha }}
           SERVERLESS_ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}

@@ -67,7 +67,7 @@ test('CD verifica hashes distintos por função sem inferir procedência a parti
   deployed.Other = { ...deployed.Worker, CodeSha256: Buffer.from(manifest.checksums.Other, 'hex').toString('base64') };
   assert.doesNotThrow(() => assertDeployedCode(manifest, deployed));
   deployed.Other.CodeSha256 = deployed.Worker.CodeSha256;
-  assert.throws(() => assertDeployedCode(manifest, deployed), /Other: deployed code/);
+  assert.throws(() => assertDeployedCode(manifest, deployed), /Lambda deployed code/);
 });
 
 test('CD valida baseline e bytes S3 mesmo sem novos commits; recuperação não avança após drift', () => {
@@ -93,6 +93,12 @@ const args = process.argv.slice(2);
 const fixture = JSON.parse(fs.readFileSync(process.env.CD_FIXTURE, 'utf8'));
 const operation = args.slice(0, 2).join(' ');
 fs.appendFileSync(process.env.CD_CALLS, operation + '\\n');
+if (fixture.rawStdout !== undefined) { process.stdout.write(fixture.rawStdout); process.exit(0); }
+if (fixture.commandFailureOutput !== undefined) {
+  process.stdout.write(fixture.commandFailureOutput);
+  process.stderr.write(fixture.commandFailureOutput);
+  process.exit(17);
+}
 const arg = name => args[args.indexOf(name) + 1];
 let output;
 if (operation === 's3api get-object') {
@@ -139,6 +145,25 @@ process.stdout.write(JSON.stringify(output));
     const recoveryResult = execute(resumed);
     assert.equal(recoveryResult.status, 1); assert.match(recoveryResult.stderr, /deployed code differs/);
     assert.match(recoveryResult.calls, /describe-change-set/);
+    // Exercita a saída pública real do processo, inclusive warnings fora do catch do CLI.
+    const marker = 'SECRET42';
+    const invalidConfig = structuredClone(fixture); invalidConfig.objects['config.json'].bytes = marker;
+    const invalidCliJson = structuredClone(fixture); invalidCliJson.rawStdout = marker;
+    const failedCommand = structuredClone(fixture); failedCommand.commandFailureOutput = marker;
+    const invalidYaml = structuredClone(fixture); invalidYaml.template = `Endpoint: "https://${marker}.example.test\n`;
+    const warningYaml = structuredClone(fixture); warningYaml.template = `Endpoint: !Sub https://${marker}.example.test`;
+    for (const [value, expectedError] of [
+      [invalidConfig, /private diagnostics suppressed/],
+      [invalidCliJson, /private diagnostics suppressed/],
+      [failedCommand, /sensitive output suppressed/],
+      [invalidYaml, /Deployment YAML is invalid/],
+      [warningYaml, /Deployment YAML is invalid/],
+    ] as [Obj, RegExp][]) {
+      const result = execute(value);
+      assert.equal(result.status, 1, 'o diagnóstico privado não pode virar sucesso');
+      assert.match(result.stderr, expectedError);
+      assert.equal(result.stdout.includes(marker) || result.stderr.includes(marker), false, 'stdout/stderr não podem conter o marcador privado');
+    }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -361,6 +386,14 @@ test('CI/CD workflows are pinned, production-only, disabled by default, and do n
   assert.equal(deploy.jobs.deploy.environment, 'production');
   assert.deepEqual(deploy.concurrency, { group: 'production', 'cancel-in-progress': false, queue: 'max' });
   assert.equal(deploy.jobs.deploy.permissions['id-token'], 'write');
+  const deploySteps = deploy.jobs.deploy.steps as Obj[];
+  const awsStep = deploySteps.find(step => step.uses?.startsWith('aws-actions/configure-aws-credentials@'))!;
+  assert.equal(awsStep.with['role-to-assume'], '${{ secrets.AWS_DEPLOY_ROLE_ARN }}');
+  assert.equal(awsStep.with['allowed-account-ids'], '${{ secrets.AWS_ACCOUNT_ID }}');
+  assert.equal(awsStep.with['mask-aws-account-id'], true);
+  const deployment = deploySteps.find(step => step.run === 'node scripts/ci-deploy.mjs')!;
+  assert.equal(deployment.env.BRIDGE_CD_CONFIG_URI, '${{ secrets.BRIDGE_CD_CONFIG_URI }}');
+  assert.equal(deployment.env.BRIDGE_CD_CONFIG_VERSION, '${{ secrets.BRIDGE_CD_CONFIG_VERSION }}');
   for (const workflow of [ci, deploy]) {
     for (const job of Object.values(workflow.jobs) as Obj[]) {
       const steps = job.steps as Obj[];
@@ -371,4 +404,37 @@ test('CI/CD workflows are pinned, production-only, disabled by default, and do n
     }
   }
   assert.equal(digest({ b: 2, a: 1 }), digest({ a: 1, b: 2 }));
+});
+
+test('CD mascara RoleId e nome antes da action; entrada inválida falha sem emitir valores', () => {
+  const workflow = parse(readFileSync(new URL('../.github/workflows/deploy.yml', import.meta.url), 'utf8'));
+  const steps = workflow.jobs.deploy.steps as Obj[];
+  const maskIndex = steps.findIndex(step => step.id === 'mask-deployment-identity');
+  const awsIndex = steps.findIndex(step => step.uses?.startsWith('aws-actions/configure-aws-credentials@'));
+  assert.ok(maskIndex >= 0 && maskIndex < awsIndex);
+  const masker = steps[maskIndex];
+  assert.ok(masker);
+  assert.equal(masker.env.AWS_DEPLOY_ROLE_ARN, '${{ secrets.AWS_DEPLOY_ROLE_ARN }}');
+  assert.equal(masker.env.AWS_DEPLOY_ROLE_ID, '${{ secrets.AWS_DEPLOY_ROLE_ID }}');
+  const roleId = `AROA${'A'.repeat(17)}`;
+  const roleName = 'example-deployment';
+  const arn = `arn:aws:iam::123456789012:role/example/path/${roleName}`;
+  const execute = (roleArn: string, identity: string) => spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', masker.run], {
+    encoding: 'utf8', env: { PATH: process.env.PATH, AWS_DEPLOY_ROLE_ARN: roleArn, AWS_DEPLOY_ROLE_ID: identity },
+  });
+  const valid = execute(arn, roleId);
+  assert.equal(valid.status, 0);
+  assert.equal(valid.stderr, '');
+  // O runner consome esses comandos; não há saída humana com os identificadores.
+  assert.deepEqual(valid.stdout.trim().split('\n'), [`::add-mask::${roleId}`, `::add-mask::${roleName}`]);
+  let statusLog = `Authenticated as assumedRoleId ${roleId}:GitHubActions; assumed-role/${roleName}/GitHubActions`;
+  for (const command of valid.stdout.trim().split('\n')) statusLog = statusLog.replaceAll(command.slice('::add-mask::'.length), '***');
+  assert.equal(statusLog.includes(roleId) || statusLog.includes(roleName), false);
+  for (const [roleArn, identity] of [[arn, ''], ['', roleId], [arn, `${roleId}\n::error::fixture`], [arn, 'invalid-fixture'], [`${arn}\nfixture`, roleId]] as [string, string][]) {
+    const invalid = execute(roleArn, identity);
+    assert.equal(invalid.status, 1);
+    assert.equal(invalid.stdout, '');
+    assert.match(invalid.stderr, /Missing or invalid private deployment identity/);
+    for (const marker of [roleId, roleName, '123456789012', '::error::fixture', 'invalid-fixture']) assert.equal(invalid.stderr.includes(marker), false);
+  }
 });
