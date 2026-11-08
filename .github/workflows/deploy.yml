@@ -1,0 +1,59 @@
+name: Production deployment (disabled until approved)
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  deploy:
+    # This must be a REPOSITORY variable, deliberately absent by default.
+    if: >-
+      vars.ENABLE_PRODUCTION_CD == 'true' &&
+      github.ref == 'refs/heads/master' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    environment: production
+    runs-on: ubuntu-24.04
+    # Keep the entire job within the AWS session lifetime; interrupted releases
+    # remain in durable state and are reconciled by a later authorized run.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run demo
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
+          role-duration-seconds: 3600
+          unset-current-credentials: true
+      - name: Deploy verified commits to the existing production stack
+        env:
+          ENABLE_PRODUCTION_CD: ${{ vars.ENABLE_PRODUCTION_CD }}
+          BRIDGE_CD_CONFIG_URI: ${{ vars.BRIDGE_CD_CONFIG_URI }}
+          BRIDGE_CD_CONFIG_VERSION: ${{ vars.BRIDGE_CD_CONFIG_VERSION }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          TARGET_SHA: ${{ github.sha }}
+          SERVERLESS_ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
+        run: node scripts/ci-deploy.mjs

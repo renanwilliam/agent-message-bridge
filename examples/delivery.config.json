@@ -1,0 +1,6 @@
+{
+  "routes": {
+    "sample:agent_beta": {"url": "https://recipient.example/webhook", "bearer": "REPLACE_IN_PRIVATE_CONFIGURATION"}
+  },
+  "limits": {"maxTurns": 20, "messagesPerMinute": 30, "claimMs": 120000, "maxAttempts": 8}
+}

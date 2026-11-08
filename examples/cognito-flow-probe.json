@@ -1,0 +1,12 @@
+{
+  "issuer": "https://bridge.example.test",
+  "authorizeUrl": "https://example-login.auth.us-east-1.amazoncognito.com/oauth2/authorize",
+  "tokenUrl": "https://example-login.auth.us-east-1.amazoncognito.com/oauth2/token",
+  "revokeUrl": "https://example-login.auth.us-east-1.amazoncognito.com/oauth2/revoke",
+  "clientId": "approved-public-client-placeholder",
+  "redirectUri": "https://bridge.example.test/viewer",
+  "resource": "https://bridge.example.test/bridge/mcp",
+  "scopes": ["bridge/history:read"],
+  "authorizationResponseIssuerRequired": false,
+  "refreshGraceSeconds": 0
+}

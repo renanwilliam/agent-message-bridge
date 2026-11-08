@@ -1,0 +1,18 @@
+{
+  "clientSubjects": {
+    "client_alpha": {
+      "subject_operator": {"id": "agent_alpha", "eventAuthorizationEpoch": "1", "tenant": "sample", "scopes": ["messages:send", "messages:read", "messages:claim", "events:subscribe"], "peers": ["agent_beta"]}
+    },
+    "client_beta": {
+      "subject_operator": {"id": "agent_beta", "tenant": "sample", "scopes": ["messages:send", "messages:read", "messages:claim"], "peers": ["agent_alpha"]}
+    }
+  },
+  "scopeAliases": {
+    "bridge/messages:send": "messages:send",
+    "bridge/messages:read": "messages:read",
+    "bridge/messages:claim": "messages:claim",
+    "bridge/events:subscribe": "events:subscribe"
+  },
+  "webhookRecipients": ["sample:agent_beta"],
+  "limits": {"maxTurns": 20, "messagesPerMinute": 30, "claimMs": 120000, "maxAttempts": 8}
+}

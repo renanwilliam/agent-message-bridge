@@ -1,0 +1,635 @@
+# This template is an undeployed, generic installation. All deployment values are
+# supplied by the operator; no secret values are resolved during packaging.
+service: ${param:serviceName, 'agent-message-bridge'}
+frameworkVersion: '4.46.0'
+configValidationMode: error
+
+plugins:
+  - ./scripts/deployment-preflight.cjs
+
+provider:
+  name: aws
+  runtime: nodejs24.x
+  architecture: arm64
+  region: ${opt:region}
+  stage: ${opt:stage}
+  memorySize: 256
+  timeout: 20
+  logRetentionInDays: 14
+  versionFunctions: false
+  iam:
+    role:
+      Fn::GetAtt: [McpRole, Arn]
+  endpointType: REGIONAL
+  apiGateway:
+    metrics: false
+  # No API Gateway request/response logging and no shared account logging-role change.
+  environment:
+    TABLE_NAME:
+      Ref: BridgeTable
+    INSTALLATION_ID: ${param:installationId}
+    OAUTH_ISSUER: ${param:oauthIssuer}
+    # Static discovery and Cognito access tokens have independently pinned issuers.
+    OAUTH_TOKEN_ISSUER: ${param:oauthTokenIssuer, param:oauthIssuer}
+    OAUTH_TOKEN_PROFILE: ${param:oauthTokenProfile, 'generic-jwt'}
+    OAUTH_AUDIENCE: ${param:oauthAudience}
+    OAUTH_JWKS_URL: ${param:oauthJwksUrl}
+    MCP_RESOURCE_URL: ${param:publicBaseUrl}/bridge/mcp
+
+build:
+  esbuild:
+    bundle: true
+    sourcemap: false
+    minify: false
+    # v4 merges defaults into empty arrays. Negate its AWS SDK external/exclude
+    # patterns to bundle the lockfile versions instead of the Lambda runtime SDK.
+    external:
+      - '!@aws-sdk/*'
+    exclude:
+      - '!@aws-sdk/*'
+    # Bundled CommonJS dependencies still require Node built-ins from ESM output.
+    banner:
+      js: 'import { createRequire as __bridgeCreateRequire } from "node:module"; const require = __bridgeCreateRequire(import.meta.url);'
+
+package:
+  individually: true
+  patterns:
+    - '!test/**'
+    - '!docs/**'
+    - '!scripts/**'
+    - '!examples/**'
+    - '!.git/**'
+    - '!.private/**'
+    - '!.env*'
+    - '!**/*.sqlite*'
+    - '!**/*.pem'
+    - '!**/*.key'
+
+mcp:
+  servers:
+    bridge:
+      server: src/remote.ts
+      timeout: 20
+      memorySize: 256
+      environment:
+        CONFIG_SECRET_ARN: ${param:mcpConfigSecretArn}
+      # Authentication is enforced in remote.ts; discovery alone grants no access.
+      oauthDiscovery:
+        issuer: ${param:oauthIssuer}
+        publicUrl: ${param:publicBaseUrl}
+
+functions:
+  ingress:
+    handler: src/aws-handlers.ingress
+    role:
+      Fn::GetAtt: [IngressRole, Arn]
+    reservedConcurrency: 4
+    environment:
+      CONFIG_SECRET_ARN: ${param:ingressConfigSecretArn}
+    events:
+      - http:
+          path: peer
+          method: post
+  history:
+    handler: src/aws-handlers.history
+    role:
+      Fn::GetAtt: [HistoryRole, Arn]
+    reservedConcurrency: 2
+    environment:
+      CONFIG_SECRET_ARN: ${param:historyConfigSecretArn}
+    events:
+      - http:
+          path: history
+          method: get
+      - http:
+          path: viewer
+          method: get
+      # Returns metadata only when explicitly configured; bootstrap stays closed.
+      - http:
+          path: .well-known/oauth-authorization-server
+          method: get
+      - http:
+          path: .well-known/oauth-authorization-server
+          method: options
+  streamWake:
+    handler: src/aws-handlers.streamWake
+    role:
+      Fn::GetAtt: [StreamRole, Arn]
+    environment:
+      OUTBOX_QUEUE_URL:
+        Ref: OutboxQueue
+    events:
+      - stream:
+          type: dynamodb
+          arn:
+            Fn::GetAtt: [BridgeTable, StreamArn]
+          startingPosition: TRIM_HORIZON
+          batchSize: 10
+          maximumRetryAttempts: 5
+          maximumRecordAgeInSeconds: 3600
+          bisectBatchOnFunctionError: true
+          functionResponseType: ReportBatchItemFailures
+          # Leases/retries update rows. Wake only on INSERT to avoid queue feedback.
+          filterPatterns:
+            - eventName: [INSERT]
+          destinations:
+            onFailure:
+              arn:
+                Fn::GetAtt: [StreamFailureQueue, Arn]
+              type: sqs
+  delivery:
+    handler: src/aws-handlers.delivery
+    role:
+      Fn::GetAtt: [DeliveryRole, Arn]
+    timeout: 30
+    environment:
+      CONFIG_SECRET_ARN: ${param:deliveryConfigSecretArn}
+    reservedConcurrency: 4
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [OutboxQueue, Arn]
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+          maximumConcurrency: 4
+  sweep:
+    handler: src/aws-handlers.sweep
+    role:
+      Fn::GetAtt: [SweepRole, Arn]
+    environment:
+      OUTBOX_QUEUE_URL:
+        Ref: OutboxQueue
+    reservedConcurrency: 1
+
+resources:
+  Resources:
+    BridgeTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: pk
+            AttributeType: S
+          - AttributeName: sk
+            AttributeType: S
+          - AttributeName: duePk
+            AttributeType: S
+          - AttributeName: dueAt
+            AttributeType: N
+        KeySchema:
+          - AttributeName: pk
+            KeyType: HASH
+          - AttributeName: sk
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: due-index
+            KeySchema:
+              - AttributeName: duePk
+                KeyType: HASH
+              - AttributeName: dueAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: KEYS_ONLY
+        SSESpecification:
+          SSEEnabled: true
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        StreamSpecification:
+          StreamViewType: KEYS_ONLY
+        # Deliberately no TTL on this table: lease expiry must not delete history.
+    OutboxQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        SqsManagedSseEnabled: true
+        VisibilityTimeout: 180
+        MessageRetentionPeriod: 345600
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [DeliveryFailureQueue, Arn]
+          maxReceiveCount: 5
+    DeliveryFailureQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        SqsManagedSseEnabled: true
+        MessageRetentionPeriod: 1209600
+    StreamFailureQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        SqsManagedSseEnabled: true
+        MessageRetentionPeriod: 1209600
+    McpRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: &id001
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+        Policies:
+        - PolicyName: bridge-bridge
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+                Fn::GetAtt:
+                - BridgeLogGroup
+                - Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: ${param:mcpConfigSecretArn}
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#meta#*
+                  - ${param:installationId}#history#*
+                  - ${param:installationId}#claims#*
+                  - ${param:installationId}#dedup#*
+                  - ${param:installationId}#rate#*
+                  - ${param:installationId}#subscriptions#*
+                  - ${param:installationId}#subscription-secrets#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#history#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#meta#*
+                  - ${param:installationId}#history#*
+                  - ${param:installationId}#claims#*
+                  - ${param:installationId}#dedup#*
+                  - ${param:installationId}#rate#*
+                  - ${param:installationId}#outbox#*
+                  - ${param:installationId}#subscriptions#*
+                  - ${param:installationId}#subscription-secrets#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+                ForAnyValue:StringEquals:
+                  dynamodb:EnclosingOperation:
+                  - TransactWriteItems
+    IngressRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *id001
+        Policies:
+        - PolicyName: bridge-ingress
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+                Fn::GetAtt:
+                - IngressLogGroup
+                - Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: ${param:ingressConfigSecretArn}
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#meta#*
+                  - ${param:installationId}#history#*
+                  - ${param:installationId}#claims#*
+                  - ${param:installationId}#dedup#*
+                  - ${param:installationId}#rate#*
+                  - ${param:installationId}#subscriptions#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#history#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#meta#*
+                  - ${param:installationId}#history#*
+                  - ${param:installationId}#claims#*
+                  - ${param:installationId}#dedup#*
+                  - ${param:installationId}#rate#*
+                  - ${param:installationId}#outbox#*
+                  - ${param:installationId}#callback#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+                ForAnyValue:StringEquals:
+                  dynamodb:EnclosingOperation:
+                  - TransactWriteItems
+    HistoryRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *id001
+        Policies:
+        - PolicyName: bridge-history
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+                Fn::GetAtt:
+                - HistoryLogGroup
+                - Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: ${param:historyConfigSecretArn}
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#meta#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#history#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+    StreamRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *id001
+        Policies:
+        - PolicyName: bridge-streamWake
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+                Fn::GetAtt:
+                - StreamWakeLogGroup
+                - Arn
+            - Effect: Allow
+              Action:
+              - dynamodb:DescribeStream
+              - dynamodb:GetRecords
+              - dynamodb:GetShardIterator
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - StreamArn
+            - Effect: Allow
+              Action: dynamodb:ListStreams
+              Resource: '*'
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource:
+              - Fn::GetAtt:
+                - OutboxQueue
+                - Arn
+              - Fn::GetAtt:
+                - StreamFailureQueue
+                - Arn
+    DeliveryRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *id001
+        Policies:
+        - PolicyName: bridge-delivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+                Fn::GetAtt:
+                - DeliveryLogGroup
+                - Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: ${param:deliveryConfigSecretArn}
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#outbox#*
+                  - ${param:installationId}#claims#*
+                  - ${param:installationId}#subscriptions#*
+                  - ${param:installationId}#subscription-secrets#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource:
+                Fn::GetAtt:
+                - BridgeTable
+                - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#outbox#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+                ForAnyValue:StringEquals:
+                  dynamodb:EnclosingOperation:
+                  - TransactWriteItems
+            - Effect: Allow
+              Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              Resource:
+                Fn::GetAtt:
+                - OutboxQueue
+                - Arn
+    SweepRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *id001
+        Policies:
+        - PolicyName: bridge-sweep
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+                Fn::GetAtt:
+                - SweepLogGroup
+                - Arn
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                Fn::Sub: ${BridgeTable.Arn}/index/due-index
+              Condition:
+                StringEquals:
+                  dynamodb:Select: SPECIFIC_ATTRIBUTES
+                ForAllValues:StringEquals:
+                  dynamodb:Attributes:
+                  - pk
+                  - sk
+                  - dueAt
+                  - duePk
+                'Null':
+                  dynamodb:Attributes: 'false'
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt:
+                - OutboxQueue
+                - Arn
+    RecoveryScheduleRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: scheduler.amazonaws.com
+              Action: sts:AssumeRole
+              Condition:
+                StringEquals:
+                  aws:SourceAccount:
+                    Ref: AWS::AccountId
+                ArnEquals:
+                  aws:SourceArn:
+                    Fn::GetAtt: [RecoveryScheduleGroup, Arn]
+        Policies:
+          - PolicyName: invoke-outbox-recovery
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource:
+                    Fn::GetAtt: [SweepLambdaFunction, Arn]
+    RecoveryScheduleGroup:
+      Type: AWS::Scheduler::ScheduleGroup
+    RecoverySchedule:
+      Type: AWS::Scheduler::Schedule
+      Properties:
+        GroupName:
+          Ref: RecoveryScheduleGroup
+        ScheduleExpression: rate(1 minute)
+        State: ENABLED
+        FlexibleTimeWindow:
+          Mode: 'OFF'
+        Description: Recover due outbox entries and expired delivery leases
+        Target:
+          Arn:
+            Fn::GetAtt: [SweepLambdaFunction, Arn]
+          RoleArn:
+            Fn::GetAtt: [RecoveryScheduleRole, Arn]
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 300
+            MaximumRetryAttempts: 2
+    DeliveryDlqAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmDescription: Delivery wake failures require investigation; durable outbox still owns delivery state
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value:
+              Fn::GetAtt: [DeliveryFailureQueue, QueueName]
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+    StreamDlqAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmDescription: Stream wake failures require investigation; periodic sweep remains the recovery path
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value:
+              Fn::GetAtt: [StreamFailureQueue, QueueName]
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+  Outputs:
+    TableName:
+      Value:
+        Ref: BridgeTable
+    QueueUrl:
+      Value:
+        Ref: OutboxQueue
+    McpResource:
+      Value: ${param:publicBaseUrl}/bridge/mcp

@@ -1,0 +1,11 @@
+node_modules
+.serverless
+dist
+coverage
+.private
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.pem
+*.key

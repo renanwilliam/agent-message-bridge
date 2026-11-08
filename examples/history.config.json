@@ -1,0 +1,32 @@
+{
+  "clientSubjects": {
+    "client_reader": {
+      "subject_operator": {
+        "id": "human_reader",
+        "tenant": "sample",
+        "scopes": [
+          "history:read"
+        ],
+        "peers": [],
+        "readParticipants": [
+          "agent_alpha",
+          "agent_beta"
+        ]
+      }
+    }
+  },
+  "scopeAliases": {
+    "bridge/history:read": "history:read"
+  },
+  "viewerOAuth": {
+    "authorizeUrl": "https://login.example/oauth2/authorize",
+    "tokenUrl": "https://login.example/oauth2/token",
+    "clientId": "client_reader",
+    "redirectUri": "https://bridge.example/viewer",
+    "resource": "https://bridge.example/bridge/mcp",
+    "authorizationResponseIssuerRequired": true,
+    "scopes": [
+      "bridge/history:read"
+    ]
+  }
+}

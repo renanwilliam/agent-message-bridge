@@ -1,0 +1,34 @@
+{
+  "name": "agent-message-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --import tsx --test --test-isolation=none test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "demo": "node --import tsx scripts/demo.ts",
+    "start": "node --import tsx src/local.ts",
+    "package": "serverless package"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "3.1123.0",
+    "@aws-sdk/client-secrets-manager": "3.1123.0",
+    "@aws-sdk/client-sqs": "^3.1123.0",
+    "@aws-sdk/lib-dynamodb": "3.1123.0",
+    "@modelcontextprotocol/server": "2.4.0",
+    "ipaddr.js": "2.3.0",
+    "jose": "6.1.3",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "serverless": "4.46.0",
+    "tsx": "4.22.0",
+    "typescript": "5.9.3",
+    "yaml": "2.8.3"
+  }
+}
