@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, stat, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { processingSnapshot, main } from '../scripts/processing-monitor.js';
 
 test('processing monitor follows empty pages and exposes durable dead and accepted-unconfirmed state without identifiers',async()=>{
@@ -61,7 +62,7 @@ test('stale or differently configured checkpoints fail closed rather than reusin
   await assert.rejects(processingSnapshot(call,{checkpoint:first.checkpoint},2000),/invalid_monitor_cursor/);
 });
 test('monitor CLI persists private progress, resumes after restart and does not publish partial health or cross-identity state',async()=>{
-  const directory=await mkdtemp('/tmp/opencode/bridge-monitor-'),path=join(directory,'checkpoint.json');
+  const directory=await mkdtemp(join(tmpdir(),'bridge-monitor-')),path=join(directory,'checkpoint.json');
   const env={BRIDGE_MONITOR_RESOURCE_URL:'https://bridge.example.test/bridge/mcp',BRIDGE_MONITOR_TOKEN:'synthetic-monitor-token',BRIDGE_MONITOR_NAME:'fixture',BRIDGE_MONITOR_CHECKPOINT:path,BRIDGE_MONITOR_MAX_PAGES:'1'};
   const lines:string[]=[],log=console.log;let requests=0;
   const request:typeof fetch=async(_url,init)=>{
