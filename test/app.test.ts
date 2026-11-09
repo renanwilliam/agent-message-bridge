@@ -1,3 +1,4 @@
+import { claimSortKey } from '../src/retention.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
@@ -187,7 +188,7 @@ for (const era of ['legacy', 'modern'] as const) {
     const replyClaim = await bridge.claim(alpha, 'conversation_1', 'terminal_reply');
     assert.equal(replyClaim.status, 'claimed');
     const args = { conversationId: 'conversation_1', messageId: 'terminal_reply', fence: replyClaim.fence };
-    const key = { pk: tenantKey(alpha.tenant, 'claims', 'conversation_1'), sk: 'claim#terminal_reply' };
+    const key = { pk: tenantKey(alpha.tenant, 'claims', 'conversation_1'), sk: claimSortKey(await bridge.getMessage(alpha,'conversation_1','terminal_reply')) };
     const before = await store.get(key);
     for (const invalid of [{ ...args, sender: 'alpha' }, { ...args, recipient: 'alpha' }, { ...args, fence: 0 }, { ...args, fence: 1.5 }, { ...args, fence: Number.MAX_SAFE_INTEGER + 1 }, { conversationId: args.conversationId, messageId: args.messageId }]) {
       const denied = await rpc(app, 'alpha', era, 'tools/call', { name: 'bridge_acknowledge_message', arguments: invalid });
@@ -293,7 +294,7 @@ test('ACK assinado mantém autenticação e distingue replay do envelope de retr
   assert.equal(terminalClaim.status, 'claimed');
   const args = { conversationId: 'peer_conversation', messageId: 'peer_terminal_reply', fence: terminalClaim.fence };
   const body = JSON.stringify({ action: 'acknowledge', arguments: args });
-  const key = { pk: tenantKey(beta.tenant, 'claims', 'peer_conversation'), sk: 'claim#peer_terminal_reply' };
+  const key = { pk: tenantKey(beta.tenant, 'claims', 'peer_conversation'), sk: claimSortKey(await bridge.getMessage(beta,'peer_conversation','peer_terminal_reply')) };
   const before = await store.get(key);
   async function peer(deliveryId: string, secret = webhookSecret) {
     return app.fetch(new Request('https://bridge.example.test/peer', { method: 'POST', body, headers: { ...signWebhook(secret, deliveryId, body), 'x-bridge-key-id': 'peer_beta' } }));

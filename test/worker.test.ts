@@ -1,3 +1,4 @@
+import { EMIT_MESSAGE_GENERATION } from '../src/release-protocol.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MemoryStore } from '../src/memory-store.js';
@@ -509,7 +510,7 @@ test('real publication stores message text only in history and needs no signing-
   const queued = await store.query<Delivery>(tenantKey('team_a', 'outbox', 'agent_b'), '', 100);
   assert.equal(queued.items.length, 2, 'Webhook and event notices share the persisted message reference');
   for (const row of queued.items) {
-    assert.deepEqual(Object.keys(row.value.message).sort(), ['conversationId', 'correlationId', 'id', 'recipient', 'sender', 'timestamp']);
+    assert.deepEqual(Object.keys(row.value.message).sort(), ['conversationId', 'correlationId', ...(EMIT_MESSAGE_GENERATION ? ['generation'] : []), 'id', 'recipient', 'sender', 'timestamp']);
     assert.ok(!JSON.stringify(row).includes(text));
     assert.ok(!JSON.stringify(row).includes(secret));
     assert.ok(!JSON.stringify(row).includes(callbackUrl));
@@ -629,3 +630,24 @@ for (const kind of ['event', 'webhook'] as const) {
     assert.deepEqual(await worker.drain(), []);
   });
 }
+
+test('Phase B generation stays out of strict event payloads and eventId/body are stable across retries',async()=>{
+  const store=new MemoryStore();let now=start;
+  const recipient:Principal={id:'agent_b',tenant:'team_a',scopes:['events:subscribe'],peers:[],eventAuthorizationEpoch:'1'};
+  const sender:Principal={id:'agent_a',tenant:'team_a',scopes:['messages:send'],peers:['agent_b']};
+  await setEventAuthorization(store,{tenant:recipient.tenant,owner:recipient.id},{epoch:'1',active:true},null);
+  const events=new Events(store,async(_url,body)=>({status:200,body:JSON.stringify({challenge:JSON.parse(body).challenge})}),()=>now);
+  await events.subscribe(recipient,{name:'message.received',delivery:{mode:'webhook',url:callbackUrl,secret}});
+  const bridge=new Bridge(store,{messagesPerMinute:10,claimMs:1000,webhookRecipients:[]},()=>now,true);
+  const published=await bridge.send(sender,{id:'generated',conversationId:'generated_conversation',recipient:recipient.id,text:'private'});
+  assert.ok(published.message.generation);
+  const row=(await store.query<Delivery>(tenantKey('team_a','outbox','agent_b'),'',100)).items[0]!;
+  const bodies:string[]=[];
+  const worker=new Worker(store,{...config,routes:{}},async(_url,body)=>{bodies.push(body);return {status:bodies.length===1?503:200,body:''};},()=>now);
+  assert.equal(await worker.deliver(row),'pending');now=(await store.get<Delivery>(row))!.dueAt!;
+  assert.equal(await worker.deliver(row),'done');assert.equal(bodies.length,2);assert.equal(bodies[0],bodies[1]);
+  const payload=JSON.parse(bodies[0]!);
+  assert.deepEqual(Object.keys(payload).sort(),['cursor','data','eventId','name','timestamp']);
+  assert.deepEqual(Object.keys(payload.data).sort(),['conversationId','correlationId','messageId','recipient','sender','timestamp']);
+  assert.equal(payload.eventId,row.value.id);assert.ok(!bodies[0]!.includes(published.message.generation!));
+});
