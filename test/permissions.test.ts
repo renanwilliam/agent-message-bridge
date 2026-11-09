@@ -66,7 +66,7 @@ const agentScopes=['messages:send','messages:read','messages:claim','events:subs
 const alpha:Principal={eventAuthorizationEpoch:'1',id:'alpha',tenant:installation,scopes:agentScopes,peers:['beta']};
 const beta:Principal={id:'beta',tenant:installation,scopes:agentScopes,peers:['alpha']};
 const reader:Principal={id:'reader',tenant:installation,scopes:['history:read'],peers:[],readParticipants:['alpha']};
-const config={maxTurns:20,messagesPerMinute:30,claimMs:60_000,webhookRecipients:[`${installation}:beta`]};
+const config={maxTurns:20,inboxEnabled:true,messagesPerMinute:30,claimMs:60_000,webhookRecipients:[`${installation}:beta`]};
 const secret=`whsec_${Buffer.alloc(32,17).toString('base64')}`;
 const resource='https://bridge.example.test/bridge/mcp';
 
@@ -96,6 +96,8 @@ test('actual subscribe, signed ingress, fenced response, human history and deliv
   assert.equal(claim.status,'claimed');
   if(claim.status!=='claimed')throw new Error('Expected a claim');
   await mcp.complete(alpha,{id:'response',conversationId:'conversation',recipient:'beta',text:'Synthetic response',replyTo:'request',fence:claim.fence});
+  assert.equal((await mcp.pending(beta)).messages.length,1);
+  assert.equal((await ingress.deliveries(beta)).deliveries.length,1);
   const historyApp=createApp(new Bridge(historyStore,config),new Events(historyStore,forbiddenPost),{
     resourceUrl:resource,issuer:'https://issuer.example.test',origins:[],callbacks:{},authenticate:async()=>reader,
   });
@@ -114,12 +116,14 @@ test('actual subscribe, signed ingress, fenced response, human history and deliv
   });
   // These pointers represent the dispatch/sweep boundary, outside delivery IAM.
   for(const key of await store.due(Date.now(),100))await worker.deliver(key);
-  assert.equal(delivered,2);
+  assert.equal(delivered,1,'The completed event claim suppresses a redundant callback; only the terminal webhook remains');
   assert.deepEqual([...calls].filter(value=>value.startsWith('HistoryRole:')).sort(),[
     'HistoryRole:GetItem:meta','HistoryRole:Query:history',
   ]);
   assert.ok(calls.has('IngressRole:PutItem:callback'));
-  assert.ok(calls.has('DeliveryRole:GetItem:subscription-secrets'));
+  assert.ok(calls.has('McpRole:DeleteItem:inbox'));
+  assert.ok(grants('DeliveryRole','GetItem',{pk:tenantKey(installation,'subscription-secrets',alpha.id),sk:'fixture'}));
+  assert.ok(!calls.has('DeliveryRole:GetItem:subscription-secrets'),'Completed processing suppresses credential reads and callback delivery');
   assert.ok(![...calls].some(value=>value.startsWith('IngressRole:')&&value.endsWith(':subscription-secrets')));
 });
 
@@ -134,13 +138,18 @@ test('role allowlists deny history access to claims/secrets, ingress signing sec
   assert.equal(grants('DeliveryRole','Query',key('history')),false);
   assert.equal(grants('DeliveryRole','PutItem',key('claims'),'TransactWriteItems'),false);
   for(const role of ['McpRole','IngressRole','HistoryRole','DeliveryRole']){
-    for(const kind of ['meta','history','claims','dedup','rate','outbox','subscriptions','subscription-secrets','callback']){
+    for(const kind of ['meta','history','claims','dedup','rate','outbox','inbox','subscriptions','subscription-secrets','callback']){
       const foreign={pk:tenantKey('foreign_installation',kind,'fixture'),sk:'fixture'};
       for(const action of actions)assert.equal(grants(role,action,foreign,'TransactWriteItems'),false,`${role}:${action}:${kind}`);
     }
   }
   for(const role of ['McpRole','IngressRole','DeliveryRole']){
     assert.equal(grants(role,'PutItem',key('outbox')),false,'Writes require transactional context');
-    assert.equal(grants(role,'DeleteItem',key('outbox'),'TransactWriteItems'),false,'Runtime roles cannot delete records');
+    assert.equal(grants(role,'DeleteItem',key('outbox'),'TransactWriteItems'),false,'Runtime roles cannot delete outbox evidence');
+  }
+  for(const role of ['McpRole','IngressRole']) {
+    assert.equal(grants(role,'DeleteItem',key('inbox')),false,'Inbox deletion is transaction-only');
+    assert.equal(grants(role,'DeleteItem',key('inbox'),'TransactWriteItems'),true);
+    for(const ns of ['history','claims','dedup','meta','subscriptions'])assert.equal(grants(role,'DeleteItem',key(ns),'TransactWriteItems'),false);
   }
 });

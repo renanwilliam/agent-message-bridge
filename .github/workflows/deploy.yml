@@ -1,4 +1,4 @@
-name: Production deployment (disabled until approved)
+name: Production deployment
 
 on:
   push:
@@ -66,6 +66,7 @@ jobs:
           role-duration-seconds: 3600
           unset-current-credentials: true
       - name: Deploy verified commits to the existing production stack
+        id: verified-deployment
         env:
           ENABLE_PRODUCTION_CD: ${{ vars.ENABLE_PRODUCTION_CD }}
           BRIDGE_CD_CONFIG_URI: ${{ secrets.BRIDGE_CD_CONFIG_URI }}
@@ -74,3 +75,10 @@ jobs:
           TARGET_SHA: ${{ github.sha }}
           SERVERLESS_ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
         run: node scripts/ci-deploy.mjs
+      - name: Teste funcional pós-deploy com destino autorizado
+        env:
+          TARGET_SHA: ${{ steps.verified-deployment.outputs.verified_commit }}
+          BRIDGE_PROBE_CONFIG: ${{ secrets.BRIDGE_PROBE_CONFIG }}
+          BRIDGE_PROBE_TOKEN: ${{ secrets.BRIDGE_PROBE_TOKEN }}
+          BRIDGE_PROBE_EFFECT_TOKEN: ${{ secrets.BRIDGE_PROBE_EFFECT_TOKEN }}
+        run: node --import tsx scripts/post-deploy-probe.ts

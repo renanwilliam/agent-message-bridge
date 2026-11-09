@@ -17,6 +17,6 @@ export async function runtime() {
   const bridge=new Bridge(store,{...config.limits,webhookRecipients});
   const events=new Events(store,outboundPost);
   const app=inactive?bootstrapApp():createApp(bridge,events,createOAuthAppConfig(config,process.env));
-  const worker=new Worker(store,{routes:config.routes,deliveryEnabled:!inactive,leaseMs:30000,retryMs:5000,maxAttempts:config.limits.maxAttempts,responseWaitMs:config.limits.claimMs},outboundPost);
+  const worker=new Worker(store,{routes:config.routes,deliveryEnabled:!inactive,retryJitter:true,leaseMs:30000,retryMs:5000,maxAttempts:config.limits.maxAttempts,responseWaitMs:config.limits.claimMs},outboundPost);
   return {store,bridge,events,app,worker};
 }

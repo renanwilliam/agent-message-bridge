@@ -2,7 +2,7 @@
 // Prepared production CD. No AWS operation occurs merely by importing this file.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, appendFileSync, rmSync, readdirSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -400,6 +400,8 @@ async function main() {
         record = await reconcile(record);
       } finally { run('git', ['worktree', 'remove', '--force', source], workspace); }
     }
+    verifyBaseline(record.value);
+    if(process.env.GITHUB_OUTPUT)appendFileSync(process.env.GITHUB_OUTPUT,`verified_commit=${record.value.commit}\n`);
     console.log('Production is current for the requested master commit.');
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }

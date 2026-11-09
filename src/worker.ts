@@ -5,10 +5,12 @@ import { signWebhook } from './transport.js';
 import { eventAuthorizationAllows, eventAuthorizationKey } from './event-authorization.js';
 import { isAdditionalAuthHeader } from './webhook-auth.js';
 import type { PrivateConfig } from './config.js';
+import { mcpResponseFailed } from './delivery-response.js';
+import { mapBounded } from './concurrency.js';
 export type WebhookRoute = PrivateConfig['routes'][string];
-export interface WorkerConfig { deliveryEnabled?: boolean; routes: Record<string,WebhookRoute>; leaseMs: number; retryMs: number; maxAttempts: number; responseWaitMs: number }
+export interface WorkerConfig { deliveryEnabled?: boolean; retryJitter?: boolean; routes: Record<string,WebhookRoute>; leaseMs: number; retryMs: number; maxAttempts: number; responseWaitMs: number }
 export class Worker {
-  constructor(readonly store:Store, readonly config:WorkerConfig, readonly post:OutboundPost, readonly now:()=>number=Date.now) {}
+  constructor(readonly store:Store, readonly config:WorkerConfig, readonly post:OutboundPost, readonly now:()=>number=Date.now, readonly random:()=>number=Math.random) {}
   async deliver(key:Key):Promise<string> {
     // due() candidates may carry dueAt; never propagate it into keys or terminal writes.
     key={pk:key.pk,sk:key.sk};
@@ -29,6 +31,9 @@ export class Worker {
       } catch(e) { if(e instanceof Conflict) return 'fenced'; throw e; }
     };
     if(this.config.deliveryEnabled===false) return finish('dead','integration_not_configured');
+    const processingClaim=await this.store.get<{status:string;leaseUntil:number}>({pk:tenantKey(value.tenant,'claims',value.message.conversationId),sk:claimSortKey(value.message)});
+    if(processingClaim?.value.status==='done') { value.processing='confirmed'; return finish('done'); }
+    if(processingClaim && processingClaim.value.leaseUntil>at) return finish('pending',undefined,processingClaim.value.leaseUntil+1);
     let url:string; let body:string; let headers:Record<string,string>;
     let eventSub:Row<Subscription>|undefined;
     const subscriptionActive=(sub:Subscription|undefined,now:number):sub is Subscription=>!!sub&&sub.active&&sub.expiresAt>now&&sub.id===value.subscriptionId&&sub.tenant===value.tenant&&sub.owner===value.owner&&sub.event==='message.received'&&(!sub.params.conversationId||sub.params.conversationId===value.message.conversationId)&&value.message.recipient===value.owner;
@@ -46,9 +51,6 @@ export class Worker {
       headers={}; // Sign after the final authorization/rotation reads, immediately before POST.
     } else {
       // O aceite do aviso não conclui o trabalho; a claim termina por resposta ou ACK terminal com fence.
-      const claim=await this.store.get<{status:string;leaseUntil:number}>({pk:tenantKey(value.tenant,'claims',value.message.conversationId),sk:claimSortKey(value.message)});
-      if(claim?.value.status==='done') return finish('done');
-      if(claim && claim.value.leaseUntil>at) return finish('pending',undefined,claim.value.leaseUntil+1);
       const route=this.config.routes[`${value.tenant}:${value.owner}`];
       if(!route) return finish('dead','route_missing');
       if(route.additionalAuthHeader!==undefined && !isAdditionalAuthHeader(route.additionalAuthHeader))return finish('dead','route_invalid');
@@ -61,7 +63,8 @@ export class Worker {
     const attempts=value.attempts+1;
     // Charge the attempt durably before crossing the network boundary. A crash
     // after a successful POST must not reset the bounded retry budget.
-    const attempted={...value,attempts,leaseUntil:this.now()+this.config.leaseMs};
+    const priorUncertainty=value.acceptanceUncertain??(value.attempts>0||(value.recoveredAttempts??0)>0);
+    const attempted={...value,attempts,attemptedAt:this.now(),acceptanceUncertain:true,leaseUntil:this.now()+this.config.leaseMs};
     try {
       await this.store.commit([{...key,expected:leaseVersion,retentionExpiresAt,value:attempted,dueAt:attempted.leaseUntil}]);
     } catch(e) { if(e instanceof Conflict) return 'fenced'; throw e; }
@@ -84,18 +87,24 @@ export class Worker {
       catch {return finish('dead','subscription_secret_invalid');}
       url=signing.value.url;
     }
-    if(messageExpired(value.message,this.now())) return finish('dead','message_expired');
+    if(messageExpired(value.message,this.now())) {const result=await finish('dead','message_expired');return result==='dead'?'expired':result;}
+    if(value.leaseUntil<=this.now())return finish('pending','lease_expired',this.now());
     try {
       const response=await this.post(url,body,headers);
       if(response.status>=200 && response.status<300) {
-        return value.kind==='event'?finish('done',undefined,undefined,attempts):finish('pending',undefined,at+this.config.responseWaitMs,attempts);
+        if(mcpResponseFailed(response.body))return finish(attempts>=this.config.maxAttempts?'dead':'pending','mcp_error',attempts>=this.config.maxAttempts?undefined:this.now()+this.backoff(attempts),attempts);
+        // Preserve first acceptance so repeated webhook receipts cannot renew alert grace.
+        value.acceptedAt??=this.now(); value.processing='unconfirmed';
+        return value.kind==='event'?finish('done',undefined,undefined,attempts):finish('pending',undefined,this.now()+this.config.responseWaitMs,attempts);
       }
       const permanent=response.status>=400 && response.status<500 && ![408,425,429].includes(response.status);
-      return finish(permanent || attempts>=this.config.maxAttempts?'dead':'pending',`http_${response.status}`,permanent || attempts>=this.config.maxAttempts?undefined:at+this.backoff(attempts),attempts);
+      // Only this attempt was rejected; never erase uncertainty from an older POST.
+      if([401,403,410,413].includes(response.status))value.acceptanceUncertain=priorUncertainty;
+      return finish(permanent || attempts>=this.config.maxAttempts?'dead':'pending',`http_${response.status}`,permanent || attempts>=this.config.maxAttempts?undefined:this.now()+this.backoff(attempts),attempts);
     } catch {
-      return finish(attempts>=this.config.maxAttempts?'dead':'pending','network_error',attempts>=this.config.maxAttempts?undefined:at+this.backoff(attempts),attempts);
+      return finish(attempts>=this.config.maxAttempts?'dead':'pending','network_error',attempts>=this.config.maxAttempts?undefined:this.now()+this.backoff(attempts),attempts);
     }
   }
-  private backoff(attempt:number) { return Math.min(this.config.retryMs*2**(attempt-1),3600000); }
-  async drain(limit=100) { const rows=await this.store.due(this.now(),limit); return Promise.all(rows.map(row=>this.deliver(row))); }
+  private backoff(attempt:number) { const base=Math.min(this.config.retryMs*2**(attempt-1),3600000);return this.config.retryJitter?Math.floor(base*(0.5+this.random()*0.5)):base; }
+  async drain(limit=100) { const rows=await this.store.due(this.now(),limit); return mapBounded(rows,4,row=>this.deliver(row)); }
 }

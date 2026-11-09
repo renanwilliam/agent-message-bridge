@@ -86,6 +86,22 @@ export class Events {
       },
     }] };
   }
+  async health(principal:Principal) {
+    requireScope(principal,'events:subscribe');
+    const authorization=await this.store.get<EventAuthorization>(eventAuthorizationKey(principal.tenant,principal.id));
+    const registry=await this.store.get<Registry>({pk:tenantKey(principal.tenant,'subscriptions',principal.id),sk:'_registry'});
+    const subscriptions=[];
+    for(const id of Object.keys(registry?.value.entries??{})) {
+      const row=await this.store.get<Subscription>({pk:tenantKey(principal.tenant,'subscriptions',principal.id),sk:id});
+      if(!row||row.value.owner!==principal.id||row.value.tenant!==principal.tenant)continue;
+      const sub=row.value;
+      subscriptions.push({id:sub.id,active:sub.active,expiresAt:sub.expiresAt,expired:sub.expiresAt<=this.now(),
+        authorized:eventAuthorizationAllows(authorization?.value,sub.authorizationEpoch),generationValid:validSubscriptionGeneration(sub.generation),
+        conversationFiltered:!!sub.params.conversationId});
+    }
+    return {authorizationActive:eventAuthorizationAllows(authorization?.value,principal.eventAuthorizationEpoch),subscriptions,
+      limitation:'Current bounded registry only; renewal continuity and external processing are not guaranteed.'};
+  }
 
   async subscribe(principal: Principal, params: unknown) {
     requireScope(principal, 'events:subscribe');

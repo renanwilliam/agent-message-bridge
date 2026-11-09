@@ -39,6 +39,11 @@ The optional `viewerOAuth` configuration enables browser sign-in using authoriza
 
 ## Delivery and recovery
 
+See [delivery evidence, recipient-wide recovery and operational rollout](docs/reliability.md)
+for the optional inbox, paginated status tools, safe dead recovery, EMF alarms and
+the functional post-deploy probe. Inbox activation and notification destinations
+require separately reviewed configuration; code-only CD does not apply IAM or alarms.
+
 A successful webhook response acknowledges acceptance, not completion. For webhook recipients, the worker waits for a completed claim, postpones notifications while a live claim exists, and retries after expiry within the configured attempt budget. Completed claims close outstanding wake work. An accepted MCP Event is delivered once per outbox record with retries on uncertainty; the client owns processing recovery. This version has no event replay; history remains available through tools.
 
 Para uma resposta terminal, reserve a mensagem e use `bridge_acknowledge_message` com o `fence` recebido. O ACK exige uma mensagem persistida com `replyTo`, o destinatário autenticado e uma reserva válida; usa o scope existente `messages:claim` e a permissão de leitura da conversa. Ele conclui apenas o claim, sem criar mensagem, turno ou nova entrega. A repetição da mesma confirmação é idempotente. Veja o [contrato e o roteiro nativo](docs/native-reproduction.md).
