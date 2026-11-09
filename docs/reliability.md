@@ -96,14 +96,19 @@ still race a POST; the receiver must honor its own claim/idempotency contract.
 
 Expired messages, confirmed work, live claims, recorded acceptance, legacy
 attempts with unknown evidence and network/MCP/5xx uncertainty are refused.
-Attempted recovery is allowed only for recorded 401/403/410/413 rejections, or
+`acceptanceUncertain` is persisted as true with the charged attempt, before POST.
+Only a recorded 401/403/410/413 can clear that attempt's uncertainty, and only if
+there was no prior uncertainty. A timeout, lost lease, process crash, MCP error or
+5xx remains uncertain even after a later rejection. Attempted legacy records with
+no cumulative evidence are refused, including those with `attemptedAt` and a safe
+last error. Recovery does not reset this evidence or accumulated prior attempts.
+Attempted recovery is allowed only with cumulative safe-rejection evidence, or
 records that never charged an outbound attempt. Event recovery also rechecks
 subscription activation generation, owner and authorization epoch. Delivery
 rechecks these again. A recovered 410/413 is an explicit operator decision after
 repair; those responses are never automatically retried.
-Legacy dead records with zero attempts can still qualify; records with charged
-attempts but no `attemptedAt` cannot. Do not weaken this evidence check to restore
-the old CLI's blind requeue behavior.
+Legacy dead records with zero current and prior attempts can still qualify. Do not
+weaken this evidence check to restore the old CLI's blind requeue behavior.
 
 Do not reset IDs, automatically reset budgets, recover every dead item, or treat
 an uncertain mutation as failure and repeat it. Inspect canonical state first.
@@ -119,6 +124,8 @@ exception/response text and message bodies. Signals include result, observed
 message age, attempts, categorized failure, dead delivery and unconfirmed receipt.
 A dead row observed on an SQS retry also emits the signal even if the prior
 invocation died after committing its state.
+Logical retention expiry is reported as `expired` and never contributes to
+`DeadDelivery`, whether detected at entry, immediately before POST, or on redelivery.
 
 These are **observations/counters, not a durable backlog gauge**. `MessageAge` is
 age at an invocation, not age of every pending message. `UnconfirmedAcceptance`
@@ -163,14 +170,17 @@ operator-owned directory, to resume larger cycles on subsequent invocations. It
 stores only counters and the opaque continuation cursor, mode 0600, atomically;
 the cursor can contain private identity metadata and must not be logged/shared.
 State is bound to the target, credential and options. Rotation or configuration
-changes require discarding the old private checkpoint after review. A `.lock`
+changes automatically discard the old cursor and counters and start a fresh cycle;
+partial state is never reused across credentials. A `.lock`
 prevents concurrent writers; after a crash, inspect the runner before removing a
 stale lock. No database grants or runner credentials are created.
 
 Partial cycles emit only an explicit partial status, **no heartbeat or backlog
 gauges**. Only a completed cycle emits a snapshot, timestamped at cycle start, and
-the next cycle starts from the beginning. Cycles older than 15 minutes fail closed;
-inspect capacity/interval, then discard stale continuation state to restart. Choose
+the next cycle starts from the beginning. Checkpoints older than 15 minutes (or
+ahead of the clock) are reset before collection. If a cycle expires during collection,
+its result is discarded without gauges/heartbeat and its checkpoint is reset for
+the next invocation. Repeated expiry still requires inspecting capacity/interval. Choose
 page budget and scheduling so a full cycle completes within that bound and within
 the heartbeat evaluation window. This bounds per-invocation cost, not total read
 cost: retained outbox history is still revisited each complete cycle. Sustained
@@ -240,6 +250,8 @@ remove inbox/TTL/data or revoke IAM while a writer using them is still running.
 Keep code that understands message generations, fencing and logical retention;
 pre-retention code is not a safe rollback. Use the existing verified immutable
 artifact procedure, never a blind retry or a blanket infrastructure replacement.
+Do not apply manual requeue while workers predating cumulative uncertainty tracking
+are active, including during rollback; their attempts cannot maintain that evidence.
 
 ## Functional post-deploy probe
 

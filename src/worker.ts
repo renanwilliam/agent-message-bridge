@@ -63,7 +63,8 @@ export class Worker {
     const attempts=value.attempts+1;
     // Charge the attempt durably before crossing the network boundary. A crash
     // after a successful POST must not reset the bounded retry budget.
-    const attempted={...value,attempts,attemptedAt:this.now(),leaseUntil:this.now()+this.config.leaseMs};
+    const priorUncertainty=value.acceptanceUncertain??(value.attempts>0||(value.recoveredAttempts??0)>0);
+    const attempted={...value,attempts,attemptedAt:this.now(),acceptanceUncertain:true,leaseUntil:this.now()+this.config.leaseMs};
     try {
       await this.store.commit([{...key,expected:leaseVersion,retentionExpiresAt,value:attempted,dueAt:attempted.leaseUntil}]);
     } catch(e) { if(e instanceof Conflict) return 'fenced'; throw e; }
@@ -86,7 +87,7 @@ export class Worker {
       catch {return finish('dead','subscription_secret_invalid');}
       url=signing.value.url;
     }
-    if(messageExpired(value.message,this.now())) return finish('dead','message_expired');
+    if(messageExpired(value.message,this.now())) {const result=await finish('dead','message_expired');return result==='dead'?'expired':result;}
     if(value.leaseUntil<=this.now())return finish('pending','lease_expired',this.now());
     try {
       const response=await this.post(url,body,headers);
@@ -97,6 +98,8 @@ export class Worker {
         return value.kind==='event'?finish('done',undefined,undefined,attempts):finish('pending',undefined,this.now()+this.config.responseWaitMs,attempts);
       }
       const permanent=response.status>=400 && response.status<500 && ![408,425,429].includes(response.status);
+      // Only this attempt was rejected; never erase uncertainty from an older POST.
+      if([401,403,410,413].includes(response.status))value.acceptanceUncertain=priorUncertainty;
       return finish(permanent || attempts>=this.config.maxAttempts?'dead':'pending',`http_${response.status}`,permanent || attempts>=this.config.maxAttempts?undefined:this.now()+this.backoff(attempts),attempts);
     } catch {
       return finish(attempts>=this.config.maxAttempts?'dead':'pending','network_error',attempts>=this.config.maxAttempts?undefined:this.now()+this.backoff(attempts),attempts);

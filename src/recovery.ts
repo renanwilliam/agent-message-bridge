@@ -12,7 +12,7 @@ export async function recoverDelivery(store:Store,key:Key,options:{apply?:boolea
   const value=row.value;
   if(key.pk!==tenantKey(value.tenant,'outbox',value.owner)||key.sk!==value.id)throw new Error('delivery_identity_mismatch');
   if(messageExpired(value.message,now))throw new Error('message_expired');
-  if(value.acceptedAt!==undefined || value.attempts>0 && (value.attemptedAt===undefined || !['http_401','http_403','http_410','http_413'].includes(value.lastError??'')))throw new Error('acceptance_uncertain_reconcile_recipient');
+  if(value.acceptedAt!==undefined || value.acceptanceUncertain===true || (value.attempts>0||(value.recoveredAttempts??0)>0) && value.acceptanceUncertain!==false)throw new Error('acceptance_uncertain_reconcile_recipient');
   const max=options.maxRecoveries??1;
   if(!Number.isSafeInteger(max)||max<1||max>10||(value.recoveryCount??0)>=max)throw new Error('recovery_budget_exhausted');
   const claimKey={pk:tenantKey(value.tenant,'claims',value.message.conversationId),sk:claimSortKey(value.message)};

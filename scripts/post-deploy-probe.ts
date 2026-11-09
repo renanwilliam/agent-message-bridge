@@ -66,9 +66,21 @@ export function mcpCaller(resourceUrl:string,token:string,request:typeof fetch=f
       body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:args}})});
     const raw=await boundedResponse(response);
     if(!response.ok)throw new Error('probe_http_error');
-    const data=response.headers.get('content-type')?.includes('text/event-stream')?raw.split('\n').filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trim()).filter(Boolean).at(-1):raw;
+    const events=response.headers.get('content-type')?.includes('text/event-stream')?
+      raw.replace(/\r\n?/g,'\n').split('\n\n').filter(event=>event.trim()).map(event=>event.split('\n').filter(line=>line.startsWith('data:')).map(line=>line.slice(5).replace(/^ /,'')).join('\n')).filter(Boolean):[raw];
+    const responses:Result[]=[];
+    for(const data of events) {
+      let body:Result;try {body=JSON.parse(data);}catch{throw new Error('probe_invalid_response');}
+      if(!body||typeof body!=='object'||Array.isArray(body)||body.jsonrpc!=='2.0')throw new Error('probe_invalid_response');
+      // SSE can carry notifications, but only the matching response answers this call.
+      if(body.id===undefined&&typeof body.method==='string')continue;
+      if(body.id!==1)throw new Error('probe_response_id_mismatch');
+      responses.push(body);
+    }
+    if(responses.length!==1)throw new Error('probe_invalid_response');
+    const data=JSON.stringify(responses[0]);
     if(!data||mcpResponseFailed(data))throw new Error('probe_mcp_error');
-    let body:Result;try {body=JSON.parse(data);}catch{throw new Error('probe_invalid_response');}
+    const body=responses[0]!;
     if(!body.result?.structuredContent)throw new Error('probe_result_missing');
     return body.result.structuredContent;
   };

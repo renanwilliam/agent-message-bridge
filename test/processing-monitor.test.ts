@@ -76,8 +76,6 @@ test('monitor CLI persists private progress, resumes after restart and does not 
     const saved=JSON.parse(await readFile(path,'utf8'));
     assert.equal(saved.checkpoint.phase,1);assert.equal((await stat(path)).mode&0o777,0o600);
     assert.equal(JSON.stringify(saved).includes(env.BRIDGE_MONITOR_TOKEN),false);
-    await assert.rejects(main({...env,BRIDGE_MONITOR_TOKEN:'other-synthetic-token'},request),/target_changed/);
-    assert.equal(requests,1,'Credential changes cannot resume another identity\'s partial snapshot');
     await main(env,request);
     const emf=JSON.parse(lines[1]!);assert.equal(emf.MonitorHeartbeat,1);assert.equal(emf.DeadDeliveries,0);
     assert.equal(emf._aws.Timestamp,saved.checkpoint.startedAt);assert.equal(emf.AcceptedUnconfirmed,undefined);
@@ -85,4 +83,53 @@ test('monitor CLI persists private progress, resumes after restart and does not 
     await writeFile(`${path}.lock`,'',{mode:0o600});
     await assert.rejects(main(env,request),{code:'EEXIST'});assert.equal(requests,2);
   } finally {console.log=log;await rm(directory,{recursive:true,force:true});}
+});
+for(const scenario of ['rotation_partial','rotation_complete','stale','future'] as const) {
+  test(`monitor restarts ${scenario} without mixing counters or cursors`,async()=>{
+    const directory=await mkdtemp(join(tmpdir(),'bridge-monitor-')),path=join(directory,'checkpoint.json');
+    const env={BRIDGE_MONITOR_RESOURCE_URL:'https://bridge.example.test/bridge/mcp',BRIDGE_MONITOR_TOKEN:'synthetic-token',BRIDGE_MONITOR_NAME:'fixture',BRIDGE_MONITOR_CHECKPOINT:path,BRIDGE_MONITOR_MAX_PAGES:'2'};
+    const log=console.log,lines:string[]=[],calls:Record<string,any>[]=[];
+    const request:typeof fetch=async(_url,init)=>{
+      const body=JSON.parse(init?.body as string);calls.push(body.params);
+      return new Response(JSON.stringify({jsonrpc:'2.0',id:1,result:{structuredContent:body.params.name==='bridge_list_pending'?{messages:[]}:{deliveries:[]}}}));
+    };
+    try {
+      console.log=value=>{lines.push(value);};
+      await main(env,request);
+      if(scenario!=='rotation_complete') {
+        const saved=JSON.parse(await readFile(path,'utf8'));
+        const first=await processingSnapshot(async()=>({messages:[],cursor:'old_cursor'}),{maxPages:1},Date.now());
+        if(first.complete)throw new Error('expected_partial');
+        first.checkpoint.totals.DeadDeliveries=999;
+        if(scenario==='stale')first.checkpoint.startedAt=Date.now()-900001;
+        if(scenario==='future')first.checkpoint.startedAt=Date.now()+60000;
+        await writeFile(path,JSON.stringify({...saved,checkpoint:first.checkpoint}));
+      }
+      calls.length=0;lines.length=0;
+      await main({...env,...(scenario.startsWith('rotation')?{BRIDGE_MONITOR_TOKEN:'rotated-synthetic-token'}:{})},request);
+      assert.deepEqual(calls.map(call=>call.name),['bridge_list_pending','bridge_delivery_status']);
+      assert.ok(calls.every(call=>call.arguments.cursor===undefined));
+      const emf=JSON.parse(lines[0]!);assert.equal(emf.DeadDeliveries,0);assert.equal(emf.MonitorHeartbeat,1);
+      assert.equal(JSON.parse(await readFile(path,'utf8')).checkpoint,null);
+      assert.equal((await stat(path)).mode&0o777,0o600);
+    } finally {console.log=log;await rm(directory,{recursive:true,force:true});}
+  });
+}
+test('monitor discards a cycle that expires during collection and recovers on the next invocation',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'bridge-monitor-')),path=join(directory,'checkpoint.json');
+  const env={BRIDGE_MONITOR_RESOURCE_URL:'https://bridge.example.test/bridge/mcp',BRIDGE_MONITOR_TOKEN:'synthetic-token',BRIDGE_MONITOR_NAME:'fixture',BRIDGE_MONITOR_CHECKPOINT:path,BRIDGE_MONITOR_MAX_PAGES:'1'};
+  const log=console.log,clock=Date.now,lines:string[]=[];let now=clock(),slow=false;
+  const request:typeof fetch=async(_url,init)=>{
+    if(slow)now+=900001;
+    const body=JSON.parse(init?.body as string);
+    return new Response(JSON.stringify({jsonrpc:'2.0',id:1,result:{structuredContent:body.params.name==='bridge_list_pending'?{messages:[]}:{deliveries:[]}}}));
+  };
+  try {
+    console.log=value=>{lines.push(value);};Date.now=()=>now;
+    await main(env,request);lines.length=0;slow=true;
+    await assert.rejects(main(env,request),/monitor_cycle_stale/);
+    assert.equal(lines.length,0);assert.equal(JSON.parse(await readFile(path,'utf8')).checkpoint,null);
+    slow=false;await main(env,request);await main(env,request);
+    assert.equal(JSON.parse(lines[0]!).status,'partial');assert.equal(JSON.parse(lines[1]!).MonitorHeartbeat,1);
+  } finally {Date.now=clock;console.log=log;await rm(directory,{recursive:true,force:true});}
 });

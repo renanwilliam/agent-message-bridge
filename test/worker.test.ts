@@ -121,6 +121,24 @@ test('production jitter keeps exponential retry within a bounded positive window
     assert.ok(due>=start+config.retryMs/2&&due<=start+config.retryMs);
   }
 });
+for(const failure of ['network','http','mcp'] as const) {
+  test(`jitter grows across ${failure} retries, caps at one hour and stops at exhaustion`,async()=>{
+    for(const random of [0,0.5,1]) {
+      const f=await fixture('webhook',{maxAttempts:14});
+      const worker=new Worker(f.store,{...config,maxAttempts:14,retryJitter:true},async()=>{
+        if(failure==='network')throw new Error('synthetic_timeout');
+        return failure==='http'?{status:503,body:''}:{status:200,body:'{"jsonrpc":"2.0","id":1,"result":{"isError":true}}'};
+      },f.now,()=>random);
+      const bases=[2000,4000,8000,16000,32000,64000,128000,256000,512000,1024000,2048000,3600000,3600000];
+      for(const base of bases) {
+        const before=f.now();assert.equal(await worker.deliver(f.key),'pending');
+        const due=(await f.row())!.dueAt!;
+        assert.equal(due-before,Math.floor(base*(0.5+random*0.5)));f.setTime(due);
+      }
+      assert.equal(await worker.deliver(f.key),'dead');assert.equal((await f.row())!.dueAt,undefined);
+    }
+  });
+}
 
 test('expired lease is recovered; the stale worker cannot overwrite the new owner outcome', async () => {
   const f = await fixture();

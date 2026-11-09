@@ -165,7 +165,7 @@ test('recovery refuses expired, uncertain and already processed dead records',as
   for(const state of ['accepted','network','completed','expired'] as const) {
     const f=fixture();await f.send();const key=(await f.store.due(f.now(),10))[0]!;
     const row=(await f.store.get<Delivery>(key))!;
-    await f.store.commit([{...key,expected:row.version,retentionExpiresAt:row.retentionExpiresAt,value:{...row.value,status:'dead',attempts:1,attemptedAt:f.now(),lastError:state==='network'?'network_error':'http_401',...(state==='accepted'?{acceptedAt:f.now()}:{})}}]);
+    await f.store.commit([{...key,expected:row.version,retentionExpiresAt:row.retentionExpiresAt,value:{...row.value,status:'dead',attempts:1,attemptedAt:f.now(),acceptanceUncertain:state==='network',lastError:state==='network'?'network_error':'http_401',...(state==='accepted'?{acceptedAt:f.now()}:{})}}]);
     if(state==='completed') {
       const c=await f.bridge.claim(beta,'conversation','request');
       await f.bridge.complete(beta,{id:'reply',conversationId:'conversation',recipient:'alpha',text:'Synthetic',replyTo:'request',fence:c.fence!});
@@ -183,6 +183,69 @@ test('recovery CAS cannot overwrite a claim completed after inspection',async()=
   await assert.rejects(recoverDelivery(store,key,{apply:true,expectedVersion:dry.version},f.now()),/Concurrent update/);
   assert.equal((await store.get<Delivery>(key))!.value.status,'dead');
 });
+for(const first of ['network','http_503','mcp_error','lost_lease'] as const) {
+  for(const status of [401,403,410,413]) {
+    test(`recovery preserves ${first} uncertainty after HTTP ${status}`,async()=>{
+      const f=fixture();await f.send();const key=(await f.store.due(f.now(),10))[0]!;
+      let calls=0,started!:()=>void,finish!:(response:{status:number;body:string})=>void;
+      const inFlight=new Promise<void>(resolve=>{started=resolve;});
+      const response=new Promise<{status:number;body:string}>(resolve=>{finish=resolve;});
+      const worker=new Worker(f.store,workerConfig,async()=>{
+        if(++calls>1)return {status,body:''};
+        if(first==='lost_lease'){started();return response;}
+        if(first==='network')throw new Error('synthetic_timeout');
+        return first==='http_503'?{status:503,body:''}:{status:200,body:'{"jsonrpc":"2.0","id":1,"result":{"isError":true}}'};
+      },f.now);
+      const initial=worker.deliver(key);
+      if(first==='lost_lease') {
+        await inFlight;f.advance(workerConfig.leaseMs+1);
+        assert.equal(await worker.deliver(key),'dead');
+        finish({status:200,body:''});assert.equal(await initial,'fenced');
+      } else {
+        assert.equal(await initial,'pending');f.advance(101);
+        assert.equal(await worker.deliver(key),'dead');
+      }
+      const before=(await f.store.get<Delivery>(key))!;
+      assert.equal(before.value.acceptanceUncertain,true);
+      for(const options of [{},{apply:true,expectedVersion:before.version}])await assert.rejects(recoverDelivery(f.store,key,options,f.now()),/acceptance_uncertain/);
+      assert.equal((await f.store.get(key))!.version,before.version);
+    });
+  }
+}
+test('legacy attempted deliveries remain uncertain even when their last error was a safe rejection',async()=>{
+  const f=fixture();await f.send();const key=(await f.store.due(f.now(),10))[0]!;
+  const row=(await f.store.get<Delivery>(key))!;
+  await f.store.commit([{...key,expected:row.version,retentionExpiresAt:row.retentionExpiresAt,value:{...row.value,status:'dead',attempts:2,attemptedAt:f.now(),lastError:'http_401'}}]);
+  await assert.rejects(recoverDelivery(f.store,key,{},f.now()),/acceptance_uncertain/);
+});
+test('a new safe rejection cannot establish evidence for legacy prior or recovered attempts',async()=>{
+  for(const previous of [{attempts:1},{attempts:0,recoveredAttempts:1}]) {
+    const f=fixture();await f.send();const key=(await f.store.due(f.now(),10))[0]!;
+    const row=(await f.store.get<Delivery>(key))!;
+    await f.store.commit([{...key,expected:row.version,dueAt:f.now(),retentionExpiresAt:row.retentionExpiresAt,value:{...row.value,...previous}}]);
+    await new Worker(f.store,workerConfig,async()=>({status:401,body:''}),f.now).deliver(key);
+    assert.equal((await f.store.get<Delivery>(key))!.value.acceptanceUncertain,true);
+    await assert.rejects(recoverDelivery(f.store,key,{},f.now()),/acceptance_uncertain/);
+  }
+});
+for(const phase of ['initial','pre_post'] as const) {
+  test(`expiry at ${phase} does not signal dead delivery, including SQS redelivery`,async()=>{
+    const f=fixture();await f.send();const key=(await f.store.due(f.now(),10))[0]!;
+    f.advance(HISTORY_RETENTION_MS-(phase==='pre_post'?1:0));
+    const commit=f.store.commit.bind(f.store);
+    if(phase==='pre_post')f.store.commit=async writes=>{await commit(writes);if(writes.some(w=>(w.value as Delivery)?.attempts===1))f.advance(1);};
+    let posts=0;
+    const worker=new Worker(f.store,workerConfig,async()=>{posts++;return {status:200,body:''};},f.now);
+    const signals:ReturnType<typeof deliveryMetric>[]=[];
+    const handler=createDeliveryHandler(f.store,worker,'sample',value=>{signals.push(value);});
+    const event={Records:[{messageId:'synthetic',body:JSON.stringify(key)}]};
+    await handler(event);await handler(event);
+    assert.equal(signals[0]!.Outcome,'expired');assert.equal(posts,0);
+    assert.ok(signals.every(signal=>signal.DeadDelivery===0));
+    assert.equal((await f.store.get<Delivery>(key))!.value.lastError,'message_expired');
+    assert.equal(deliveryMetric('dead',(await f.store.get<Delivery>(key))!.value).DeadDelivery,0);
+  });
+}
 test('accepted delivery exhausted as dead is recovered through inbox claim, not outbox replay, and late completion remains visible',async()=>{
   const f=fixture();await f.send();let posts=0;
   const worker=new Worker(f.store,workerConfig,async()=>{posts++;return {status:200,body:''};},f.now);

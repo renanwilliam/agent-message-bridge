@@ -50,7 +50,7 @@ test('processing without an independent effect ledger is explicitly partial',asy
 test('receiver response without matching effect evidence never passes',async()=>{
   const f=fixture();await assert.rejects(probe({...config,waitMs:2000},commit,f.call,async()=>false,f.now,f.pause),/effect_not_confirmed/);
 });
-for(const raw of ['{"jsonrpc":"2.0","error":{"code":-32603,"message":"private"}}','{"jsonrpc":"2.0","result":{"isError":true,"content":[]}}']) {
+for(const raw of ['{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"private"}}','{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[]}}']) {
   test('probe rejects MCP failure hidden behind HTTP 200 without reflecting response text',async()=>{
     const call=mcpCaller(config.resourceUrl,'synthetic-token',async()=>new Response(raw,{status:200}) as any);
     await assert.rejects(call('bridge_send_message',{}),/probe_mcp_error/);
@@ -61,6 +61,37 @@ test('CI without approved probe credentials reports partial, without creating cr
   try {console.log=(value:string)=>{lines.push(value);};await main({CI:'true'});}finally{console.log=log;}
   assert.deepEqual(JSON.parse(lines[0]!),{status:'partial',reason:'authorized_probe_configuration_missing',processingConfirmed:false});
 });
+for(const newline of ['\n','\r\n']) {
+  test(`MCP SSE parses multiline data, comments, notifications and split chunks (${JSON.stringify(newline)})`,async()=>{
+    const raw=[': keepalive','','event: message','data: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}','','event: message','data: {"jsonrpc":"2.0","id":1,','data: "result":{"structuredContent":{"ok":true}}}','',''].join(newline);
+    const bytes=new TextEncoder().encode(raw);
+    const stream=new ReadableStream({start(controller){for(let offset=0;offset<bytes.length;offset+=7)controller.enqueue(bytes.slice(offset,offset+7));controller.close();}});
+    const call=mcpCaller(config.resourceUrl,'synthetic-token',async()=>new Response(stream,{headers:{'content-type':'text/event-stream'}}));
+    assert.deepEqual(await call('bridge_list_pending',{}),{ok:true});
+  });
+}
+test('MCP JSON response requires the matching ID and SSE rejects duplicate responses',async()=>{
+  const response={jsonrpc:'2.0',id:1,result:{structuredContent:{ok:true}}};
+  const call=mcpCaller(config.resourceUrl,'synthetic-token',async()=>new Response(JSON.stringify(response)));
+  assert.deepEqual(await call('bridge_list_pending',{}),{ok:true});
+  const wrong=mcpCaller(config.resourceUrl,'synthetic-token',async()=>new Response(JSON.stringify({...response,id:2})));
+  await assert.rejects(wrong('bridge_list_pending',{}),/response_id_mismatch/);
+  const duplicate=mcpCaller(config.resourceUrl,'synthetic-token',async()=>new Response(`data: ${JSON.stringify(response)}\n\ndata: ${JSON.stringify(response)}\n\n`,{headers:{'content-type':'text/event-stream'}}));
+  await assert.rejects(duplicate('bridge_list_pending',{}),/invalid_response/);
+});
+for(const [raw,error] of [
+  ['data: {"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"private"}}\n\n','probe_mcp_error'],
+  ['data: {"jsonrpc":"2.0","id":1,"result":{"isError":true}}\n\n','probe_mcp_error'],
+  ['data: {"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"ok":true}}}\n\n','probe_response_id_mismatch'],
+  ['data: broken\n\n','probe_invalid_response'],
+  [': heartbeat\n\n','probe_invalid_response'],
+  ['data: {"jsonrpc":"2.0","id":1,"result":{}}\n\n','probe_result_missing'],
+] as const) {
+  test(`MCP SSE fails closed for ${error}`,async()=>{
+    const call=mcpCaller(config.resourceUrl,'synthetic-token',async()=>new Response(raw,{headers:{'content-type':'text/event-stream'}}));
+    await assert.rejects(call('bridge_list_pending',{}),new RegExp(error));
+  });
+}
 test('probe rejects a shared webhook sender before sending any message',async()=>{
   const f=fixture();f.bridge.config.webhookRecipients.push('sample:alpha');let sent=false;
   await assert.rejects(probe(config,commit,async(name,args)=>{if(name==='bridge_send_message')sent=true;return f.call(name,args);},undefined,f.now,f.pause),/probe_sender_not_isolated/);

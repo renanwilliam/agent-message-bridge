@@ -9,7 +9,7 @@ export function deliveryMetric(result:string,delivery:Delivery|undefined,now=Dat
   const published=Date.parse(delivery?.message.timestamp??'');
   const age=Number.isFinite(published)?Math.max(0,now-published):0;
   return {_aws:{Timestamp:now,CloudWatchMetrics:[{Namespace:'AgentMessageBridge',Dimensions:[['FunctionName'],['FunctionName','Kind','Outcome']],Metrics:[{Name:'DeliveryResult',Unit:'Count'},{Name:'MessageAge',Unit:'Milliseconds'},{Name:'DeadDelivery',Unit:'Count'},{Name:'UnconfirmedAcceptance',Unit:'Count'}]}]},
-    FunctionName:functionName,Kind:kind,Outcome:outcome,DeliveryResult:1,MessageAge:age,DeadDelivery:outcome==='dead'||delivery?.status==='dead'&&delivery.lastError!=='message_expired'?1:0,
+    FunctionName:functionName,Kind:kind,Outcome:outcome,DeliveryResult:1,MessageAge:age,DeadDelivery:(outcome==='dead'||delivery?.status==='dead')&&delivery?.lastError!=='message_expired'?1:0,
     UnconfirmedAcceptance:delivery?.acceptedAt!==undefined && delivery.processing!=='confirmed'?1:0,
     attempts:delivery?.attempts??0,...(safeReason?{reason:safeReason}:{})};
 }

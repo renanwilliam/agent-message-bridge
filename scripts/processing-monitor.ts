@@ -89,21 +89,29 @@ async function run(environment:NodeJS.ProcessEnv,request:typeof fetch) {
   if(path) {
     try {
       const saved=z.object({target:z.string(),checkpoint:checkpointSchema.nullable()}).strict().parse(JSON.parse(await readFile(path,'utf8')));
-      if(saved.target!==target)throw new Error('monitor_checkpoint_target_changed');
-      checkpoint=saved.checkpoint??undefined;
+      // Credentials/configuration changes start a fresh cycle, never reuse another target's counters.
+      checkpoint=saved.target===target?saved.checkpoint??undefined:undefined;
     } catch(error) {if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
   }
   const now=Date.now();
-  const result=await processingSnapshot(mcpCaller(url,token,request),{...options,checkpoint},now);
-  if(Date.now()-(checkpoint?.startedAt??now)>900000)throw new Error('monitor_cycle_stale');
-  if(!result.complete&&!path)throw new Error('monitor_checkpoint_required_for_large_cycle');
-  if(path) {
+  if(checkpoint&&(now<checkpoint.startedAt||now-checkpoint.startedAt>900000))checkpoint=undefined;
+  // Persist the reset before networking so a failed restart cannot revive stale state.
+  const save=async(checkpoint:MonitorCheckpoint|null)=>{
+    if(!path)return;
     const temporary=`${path}.${randomUUID()}.tmp`;
     try {
-      await writeFile(temporary,JSON.stringify({target,checkpoint:result.complete?null:result.checkpoint}),{mode:0o600,flag:'wx'});
+      await writeFile(temporary,JSON.stringify({target,checkpoint}),{mode:0o600,flag:'wx'});
       await rename(temporary,path);
     } finally {await unlink(temporary).catch(error=>{if(error.code!=='ENOENT')throw error;});}
+  };
+  if(!checkpoint)await save(null);
+  const result=await processingSnapshot(mcpCaller(url,token,request),{...options,checkpoint},now);
+  if(Date.now()<(checkpoint?.startedAt??now)||Date.now()-(checkpoint?.startedAt??now)>900000) {
+    await save(null);
+    throw new Error('monitor_cycle_stale');
   }
+  if(!result.complete&&!path)throw new Error('monitor_checkpoint_required_for_large_cycle');
+  await save(result.complete?null:result.checkpoint);
   if(!result.complete){console.log(JSON.stringify({status:'partial',reason:'monitor_cycle_in_progress_no_health_claim'}));return;}
   const {complete:_,...snapshot}=result;
   const Metrics=Object.keys(snapshot).filter(key=>key!=='coverage').map(Name=>({Name,Unit:Name==='OldestPendingAge'?'Milliseconds':'Count'}));

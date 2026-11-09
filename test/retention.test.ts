@@ -104,7 +104,7 @@ test('worker rechecks deadline immediately before POST after delayed claim read'
   const store=new Delayed();const f=fixture(store);await f.bridge.send(a,input());f.advance(HISTORY_RETENTION_MS-1);
   store.after=()=>f.advance(1);let posts=0;const worker=new Worker(store,workerConfig,async()=>{posts++;return {status:200,body:''};},f.now);
   const row=(await store.query<Delivery>(tenantKey('sample','outbox','b'),'',100)).items[0]!;
-  assert.equal(await worker.deliver(row),'dead');assert.equal(posts,0);assert.equal((await store.get(row))!.dueAt,undefined);
+  assert.equal(await worker.deliver(row),'expired');assert.equal(posts,0);assert.equal((await store.get(row))!.dueAt,undefined);
 });
 
 test('complete and ACK fail closed when the parent expires during delayed reads',async()=>{
