@@ -198,7 +198,8 @@ resources:
           PointInTimeRecoveryEnabled: true
         StreamSpecification:
           StreamViewType: KEYS_ONLY
-        # Deliberately no TTL on this table: lease expiry must not delete history.
+        # Physical TTL remains disabled pending the separate reviewed migration in docs/retention.md.
+        # Only retentionExpiresAt may be enabled; never expiresAt or leaseUntil.
     OutboxQueue:
       Type: AWS::SQS::Queue
       Properties:
