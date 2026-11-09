@@ -162,6 +162,14 @@ functions:
     reservedConcurrency: 1
 
 resources:
+  Description: Durable agent messages with isolated roles and operator-configured delivery alarms
+  Conditions:
+    HasAlarmTopic:
+      Fn::Not:
+        - Fn::Equals: ["${param:alarmTopicArn, ''}", '']
+    HasProcessingMonitor:
+      Fn::Not:
+        - Fn::Equals: ["${param:processingMonitorName, ''}", '']
   Resources:
     BridgeTable:
       Type: AWS::DynamoDB::Table
@@ -274,6 +282,8 @@ resources:
                 ForAllValues:StringLike:
                   dynamodb:LeadingKeys:
                   - ${param:installationId}#history#*
+                  - ${param:installationId}#inbox#*
+                  - ${param:installationId}#outbox#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
             - Effect: Allow
@@ -291,6 +301,7 @@ resources:
                   - ${param:installationId}#dedup#*
                   - ${param:installationId}#rate#*
                   - ${param:installationId}#outbox#*
+                  - ${param:installationId}#inbox#*
                   - ${param:installationId}#subscriptions#*
                   - ${param:installationId}#subscription-secrets#*
                 'Null':
@@ -345,6 +356,8 @@ resources:
                 ForAllValues:StringLike:
                   dynamodb:LeadingKeys:
                   - ${param:installationId}#history#*
+                  - ${param:installationId}#inbox#*
+                  - ${param:installationId}#outbox#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
             - Effect: Allow
@@ -362,6 +375,7 @@ resources:
                   - ${param:installationId}#dedup#*
                   - ${param:installationId}#rate#*
                   - ${param:installationId}#outbox#*
+                  - ${param:installationId}#inbox#*
                   - ${param:installationId}#callback#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
@@ -609,6 +623,8 @@ resources:
         Threshold: 1
         ComparisonOperator: GreaterThanOrEqualToThreshold
         TreatMissingData: notBreaching
+        AlarmActions: &alarmActions
+          Fn::If: [HasAlarmTopic, ["${param:alarmTopicArn, ''}"], []]
     StreamDlqAlarm:
       Type: AWS::CloudWatch::Alarm
       Properties:
@@ -625,6 +641,103 @@ resources:
         Threshold: 1
         ComparisonOperator: GreaterThanOrEqualToThreshold
         TreatMissingData: notBreaching
+        AlarmActions: *alarmActions
+    DeadDeliveryAlarm:
+      Type: AWS::CloudWatch::Alarm
+      # Worker terminal outcomes acknowledge SQS successfully and never reach its DLQ.
+      Properties:
+        AlarmDescription: A durable delivery became dead; inspect processing evidence before recovery
+        Namespace: AgentMessageBridge
+        MetricName: DeadDelivery
+        Dimensions:
+          - Name: FunctionName
+            Value:
+              Ref: DeliveryLambdaFunction
+        Statistic: Sum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: *alarmActions
+    OldPendingAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: HasProcessingMonitor
+      # Gauges require the separately authorized periodic MCP monitor, not worker traffic.
+      Properties:
+        AlarmDescription: Unfinished incoming work exceeded the configured age threshold
+        Namespace: AgentMessageBridge
+        MetricName: OldestPendingAge
+        Dimensions: &monitorDimensions
+          - Name: Monitor
+            Value: ${param:processingMonitorName, ''}
+        Statistic: Maximum
+        Period: ${param:processingMonitorPeriodSeconds, 60}
+        EvaluationPeriods: 1
+        Threshold: ${param:pendingAgeThresholdMs, 300000}
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: *alarmActions
+    UnconfirmedProcessingAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: HasProcessingMonitor
+      Properties:
+        AlarmDescription: Accepted deliveries have no confirmed processing evidence
+        Namespace: AgentMessageBridge
+        MetricName: AcceptedUnconfirmed
+        Dimensions: *monitorDimensions
+        Statistic: Maximum
+        Period: ${param:processingMonitorPeriodSeconds, 60}
+        EvaluationPeriods: 1
+        Threshold: ${param:unconfirmedCountThreshold, 1}
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: *alarmActions
+    DeadBacklogAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: HasProcessingMonitor
+      Properties:
+        AlarmDescription: Durable dead deliveries require controlled investigation
+        Namespace: AgentMessageBridge
+        MetricName: DeadDeliveries
+        Dimensions: *monitorDimensions
+        Statistic: Maximum
+        Period: ${param:processingMonitorPeriodSeconds, 60}
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: *alarmActions
+    SubscriptionHealthAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: HasProcessingMonitor
+      Properties:
+        AlarmDescription: The monitored recipient has missing or unhealthy current subscriptions
+        Namespace: AgentMessageBridge
+        MetricName: UnhealthySubscriptions
+        Dimensions: *monitorDimensions
+        Statistic: Maximum
+        Period: ${param:processingMonitorPeriodSeconds, 60}
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: *alarmActions
+    ProcessingMonitorMissingAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: HasProcessingMonitor
+      Properties:
+        AlarmDescription: The authorized processing monitor stopped producing complete snapshots
+        Namespace: AgentMessageBridge
+        MetricName: MonitorHeartbeat
+        Dimensions: *monitorDimensions
+        Statistic: Minimum
+        Period: ${param:processingMonitorPeriodSeconds, 60}
+        EvaluationPeriods: 3
+        Threshold: 1
+        ComparisonOperator: LessThanThreshold
+        TreatMissingData: breaching
+        AlarmActions: *alarmActions
   Outputs:
     TableName:
       Value:

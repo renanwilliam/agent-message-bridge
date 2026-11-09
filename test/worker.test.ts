@@ -79,6 +79,33 @@ test('competing workers acquire one lease and only one outbound wake occurs', as
   assert.equal(row.dueAt, start + config.responseWaitMs);
 });
 
+test('accepted MCP event is explicitly unconfirmed and is not replayed merely because no claim appeared',async()=>{
+  const f=await fixture('event');let posts=0;
+  const worker=f.worker(async()=>{posts++;return {status:202,body:''};});
+  assert.equal(await worker.deliver(f.key),'done');
+  const row=(await f.row())!;assert.equal(row.value.acceptedAt,start);assert.equal(row.value.processing,'unconfirmed');
+  assert.equal(row.dueAt,undefined);f.advance(120000);
+  assert.equal(await worker.deliver(f.key),'skipped');assert.equal(posts,1);
+});
+
+test('MCP event with an already completed claim is closed without another callback or secret read',async()=>{
+  const f=await fixture('event');
+  await f.store.commit([{...f.claimKey,expected:null,value:{status:'done',leaseUntil:0}}]);
+  assert.equal(await f.worker(async()=>{throw new Error('must not POST');}).deliver(f.key),'done');
+  assert.equal((await f.row())!.value.processing,'confirmed');
+  assert.equal(wasRead(f.store.reads,f.subscriptionSecretKey),false);
+});
+
+test('production jitter keeps exponential retry within a bounded positive window',async()=>{
+  for(const random of [0,0.5,1]) {
+    const f=await fixture();
+    const worker=new Worker(f.store,{...config,retryJitter:true},async()=>({status:503,body:''}),f.now,()=>random);
+    await worker.deliver(f.key);
+    const due=(await f.row())!.dueAt!;
+    assert.ok(due>=start+config.retryMs/2&&due<=start+config.retryMs);
+  }
+});
+
 test('expired lease is recovered; the stale worker cannot overwrite the new owner outcome', async () => {
   const f = await fixture();
   const started = deferred<void>();

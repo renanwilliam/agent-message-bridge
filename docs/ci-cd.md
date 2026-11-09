@@ -55,7 +55,10 @@ Six Lambda updates are not an atomic application release. Old and new code can
 coexist during update or rollback, and queues can hold older messages. Every
 automatic release must remain compatible with the current data and message
 schema. The pipeline verifies CloudFormation completion and each deployed ZIP's
-SHA-256; it does not yet perform a live OAuth or agent-to-agent acceptance test.
+SHA-256. The workflow then runs the optional authorized functional probe described
+in [reliability operations](reliability.md#functional-post-deploy-probe). Missing
+credentials or independent receiver evidence produce an explicit partial result,
+not a live acceptance claim. Deployment state and functional acceptance are separate.
 
 ## Prerequisites requiring separate approval
 

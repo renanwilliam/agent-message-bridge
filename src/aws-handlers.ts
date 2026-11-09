@@ -4,16 +4,17 @@ import { env } from './config.js';
 import { runtime } from './runtime.js';
 import type { Key } from './store.js';
 import { createStreamWake, type StreamRecord } from './dispatch.js';
+import { createDeliveryHandler } from './delivery-handler.js';
+import { mapBounded } from './concurrency.js';
 const sqs=new SQSClient({});
 async function enqueue(key:Key) {await sqs.send(new SendMessageCommand({QueueUrl:env('OUTBOX_QUEUE_URL'),MessageBody:JSON.stringify({pk:key.pk,sk:key.sk})}));}
-export async function sweep() {const rows=await new DynamoStore(env('TABLE_NAME')).due(Date.now(),100);await Promise.all(rows.map(enqueue));return {enqueued:rows.length};}
+export async function sweep() {const rows=await new DynamoStore(env('TABLE_NAME')).due(Date.now(),100);await mapBounded(rows,4,enqueue);return {enqueued:rows.length};}
 export async function streamWake(event:{Records:StreamRecord[]}) {
   return createStreamWake(enqueue,env('INSTALLATION_ID'))(event);
 }
 export async function delivery(event:{Records:{messageId:string;body:string}[]}) {
-  const {worker}=await runtime();const batchItemFailures:{itemIdentifier:string}[]=[];
-  for(const record of event.Records) {try{const key=JSON.parse(record.body);if(typeof key.pk!=='string'||typeof key.sk!=='string')throw new Error('invalid key');await worker.deliver(key);}catch{batchItemFailures.push({itemIdentifier:record.messageId});}}
-  return {batchItemFailures};
+  const {worker,store}=await runtime();
+  return createDeliveryHandler(store,worker,env('INSTALLATION_ID'))(event);
 }
 interface ApiEvent {path?:string;rawPath?:string;httpMethod?:string;requestContext?:{http?:{method?:string}};headers?:Record<string,string>;queryStringParameters?:Record<string,string>;body?:string;isBase64Encoded?:boolean}
 export async function ingress(event:ApiEvent) {

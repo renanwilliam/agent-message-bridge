@@ -14,8 +14,8 @@ const require = createRequire(import.meta.url);
 const { validateDeployment }: { validateDeployment: (config: Obj) => void } = require('../scripts/deployment-preflight.cjs');
 
 const namespaceContract: Record<string, Record<string, string[]>> = {
-  McpRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','subscription-secrets'],Query:['history'],PutItem:['meta','history','claims','dedup','rate','outbox','subscriptions','subscription-secrets']},
-  IngressRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions'],Query:['history'],PutItem:['meta','history','claims','dedup','rate','outbox','callback']},
+  McpRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','subscription-secrets'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','subscriptions','subscription-secrets']},
+  IngressRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','callback']},
   HistoryRole: {GetItem:['meta'],Query:['history']},
   DeliveryRole: {GetItem:['outbox','claims','subscriptions','subscription-secrets'],PutItem:['outbox']},
 };
@@ -124,6 +124,20 @@ test('queue recovery and scheduler use bounded delivery with a dedicated invocat
   assert.equal(manifest.functions.delivery.events[0].sqs.functionResponseType, 'ReportBatchItemFailures');
   assert.ok(manifest.functions.delivery.reservedConcurrency >= manifest.functions.delivery.events[0].sqs.maximumConcurrency);
   assertSchedulerRoles(resources);
+});
+
+test('dead-delivery and DLQ alarms share an optional operator-approved destination without provisioning notification access',()=>{
+  const actions={'Fn::If':['HasAlarmTopic',["${param:alarmTopicArn, ''}"],[]]};
+  for(const name of ['DeliveryDlqAlarm','StreamDlqAlarm','DeadDeliveryAlarm'])assert.deepEqual(resources[name].Properties.AlarmActions,actions);
+  assert.equal(resources.DeadDeliveryAlarm.Properties.MetricName,'DeadDelivery');
+  assert.deepEqual(resources.DeadDeliveryAlarm.Properties.Dimensions,[{Name:'FunctionName',Value:{Ref:'DeliveryLambdaFunction'}}]);
+  assert.equal(Object.values(resources).some((r:any)=>r.Type==='AWS::SNS::Topic'||r.Type==='AWS::SNS::Subscription'),false);
+  for(const name of ['OldPendingAlarm','UnconfirmedProcessingAlarm','DeadBacklogAlarm','SubscriptionHealthAlarm','ProcessingMonitorMissingAlarm']) {
+    assert.equal(resources[name].Condition,'HasProcessingMonitor');
+    assert.deepEqual(resources[name].Properties.AlarmActions,actions);
+    assert.deepEqual(resources[name].Properties.Dimensions,[{Name:'Monitor',Value:"${param:processingMonitorName, ''}"}]);
+  }
+  assert.equal(resources.ProcessingMonitorMissingAlarm.Properties.TreatMissingData,'breaching');
 });
 
 test('deployment archive excludes local secrets, histories, examples and preflight source', () => {

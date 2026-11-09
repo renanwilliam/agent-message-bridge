@@ -3,11 +3,11 @@ import { claimSortKey, HISTORY_RETENTION_MS, messageExpired, retentionDeadline, 
 import { createHash, randomUUID } from 'node:crypto';
 import { activeSubscriptions } from './events.js';
 import { Conflict, type Store, type Write } from './store.js';
-import { BridgeError, requireScope, tenantKey, type Principal, type Message, type MessageInput, type Delivery } from './types.js';
+import { BridgeError, requireScope, tenantKey, type Principal, type Message, type MessageInput, type Delivery, type MessageNotice } from './types.js';
 
 const identifier = /^[a-zA-Z0-9_-]{1,100}$/;
 export function id(value: unknown): string { if (typeof value !== 'string' || !identifier.test(value)) throw new BridgeError('invalid_id'); return value; }
-export interface BridgeConfig { /** @deprecated Accepted for old configurations, ignored. */ maxTurns?: number; messagesPerMinute: number; claimMs: number; webhookRecipients: string[] }
+export interface BridgeConfig { /** @deprecated Accepted for old configurations, ignored. */ maxTurns?: number; inboxEnabled?: boolean; messagesPerMinute: number; claimMs: number; webhookRecipients: string[] }
 interface Conversation { participants: string[]; count: number; correlationId: string; claimFence?: number }
 interface Claim { owner: string; fence: number; leaseUntil: number; status: 'running'|'done'; responseId?: string; outcome?: 'acknowledged' }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -74,6 +74,9 @@ export class Bridge {
       }
       if(!Number.isSafeInteger((conv?.value.count??0)+1)) throw new BridgeError('sequence_exhausted',409);
       const message: Message={...(this.emitMessageGeneration?{generation:randomUUID()}:{}),id:input.id,conversationId:input.conversationId,correlationId:conv?.value.correlationId??input.id,sender:p.id,recipient:input.recipient,text:input.text,timestamp:new Date(at).toISOString(),turn:(conv?.value.count??0)+1,...(input.replyTo?{replyTo:input.replyTo}:{})};
+      const {text: _text,turn: _turn,replyTo: _replyTo,...notice}=message;
+      // Recipient discovery is independent of callback availability and subscription filters.
+      if(this.config.inboxEnabled)writes.push({pk:tenantKey(p.tenant,'inbox',message.recipient),sk:`message#${message.timestamp}#${message.id}#${message.generation??'legacy'}`,expected:null,retentionExpiresAt:retentionTTL(message),value:notice});
       writes.push({pk,sk:'meta',expected:conv?.version??null,value:{...(conv?conv.value:{claimFence:0}),participants:conv?.value.participants??[p.id,input.recipient],count:message.turn,correlationId:message.correlationId}},
         {pk:historyPk,sk:`message#${message.turn<10_000_000_000?String(message.turn).padStart(10,'0'):'~'+String(message.turn).padStart(16,'0')}#${message.id}`,expected:null,retentionExpiresAt:retentionTTL(message),value:message},
         {pk:historyPk,sk:`id#${message.id}`,expected:null,retentionExpiresAt:retentionTTL(message),value:message},
@@ -102,6 +105,44 @@ export class Bridge {
     if(!p.scopes.includes('history:read')) requireScope(p,'messages:read'); await this.conversation(p,conversationId);
     const page=await this.store.query<Message>(tenantKey(p.tenant,'history',conversationId),'message#',limit,cursor);
     return {messages:page.items.filter(row=>!messageExpired(row.value,this.now())).map(row=>row.value),...(page.cursor?{cursor:page.cursor}:{})};
+  }
+  async pending(p:Principal,limit=30,cursor?:string) {
+    requireScope(p,'messages:read'); requireScope(p,'messages:claim');
+    if(!this.config.inboxEnabled)throw new BridgeError('inbox_not_enabled',503);
+    const page=await this.store.query<MessageNotice>(tenantKey(p.tenant,'inbox',p.id),'message#',limit,cursor);
+    const messages=[];
+    for(const row of page.items) {
+      const notice=row.value;
+      if(notice.recipient!==p.id || messageExpired(notice,this.now()))continue;
+      // Recheck the conversation ACL, not just the recipient index.
+      try { await this.conversation(p,notice.conversationId); }
+      catch(e) { if(e instanceof BridgeError && e.code==='conversation_not_found')continue; throw e; }
+      const claim=await this.store.get<Claim>({pk:tenantKey(p.tenant,'claims',notice.conversationId),sk:claimSortKey(notice)});
+      if(messageExpired(notice,this.now()))continue;
+      if(claim?.value.status==='done')continue;
+      messages.push({...notice,processing:claim && claim.value.leaseUntil>this.now()?'running' as const:'available' as const,
+        ...(claim && claim.value.leaseUntil>this.now()?{retryAfter:claim.value.leaseUntil}:{})});
+    }
+    return {messages,...(page.cursor?{cursor:page.cursor}:{})};
+  }
+  async deliveries(p:Principal,limit=30,cursor?:string) {
+    requireScope(p,'messages:read'); requireScope(p,'messages:claim');
+    const page=await this.store.query<Delivery>(tenantKey(p.tenant,'outbox',p.id),'',limit,cursor);
+    const deliveries=[];
+    for(const row of page.items) {
+      const value=row.value;
+      if(value.tenant!==p.tenant || value.owner!==p.id || value.message.recipient!==p.id || messageExpired(value.message,this.now()))continue;
+      try { await this.conversation(p,value.message.conversationId); }
+      catch(e) { if(e instanceof BridgeError && e.code==='conversation_not_found')continue; throw e; }
+      const claim=await this.store.get<Claim>({pk:tenantKey(p.tenant,'claims',value.message.conversationId),sk:claimSortKey(value.message)});
+      if(messageExpired(value.message,this.now()))continue;
+      deliveries.push({id:value.id,kind:value.kind,message:value.message,status:value.status,attempts:value.attempts,
+        lastError:value.lastError,attemptedAt:value.attemptedAt,acceptedAt:value.acceptedAt,dueAt:row.dueAt,
+        processing:claim?.value.status==='done'?'confirmed':claim && claim.value.leaseUntil>this.now()?'running':'unconfirmed',
+        expiredClaim:claim?.value.status==='running' && claim.value.leaseUntil<=this.now(),
+        acceptanceEvidence:value.acceptedAt!==undefined?'recorded':'unknown'});
+    }
+    return {deliveries,...(page.cursor?{cursor:page.cursor}:{})};
   }
   async getMessage(p:Principal,conversationId:string,messageId:string) {
     if(!p.scopes.includes('history:read')) requireScope(p,'messages:read'); await this.conversation(p,conversationId);

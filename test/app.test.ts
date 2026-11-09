@@ -90,6 +90,31 @@ function message(id = 'message_1', conversationId = 'conversation_1') {
 }
 
 for (const era of ['legacy', 'modern'] as const) {
+  test(`${era}: inbox/status tools are gated, authenticated and support recipient-wide discovery`,async()=>{
+    const f=await fixture();
+    const disabled=await rpc(f.app,'beta',era,'tools/list');
+    assert.equal(disabled.body.result.tools.some((t:JsonRecord)=>t.name==='bridge_list_pending'),false);
+    f.bridge.config.inboxEnabled=true;
+    await tool(f.app,'alpha',era,'bridge_send_message',message('pending_one','one'));
+    await tool(f.app,'alpha',era,'bridge_send_message',message('pending_two','two'));
+    const first=await tool(f.app,'beta',era,'bridge_list_pending',{limit:1});assert.equal(first.messages.length,1);assert.ok(first.cursor);
+    const second=await tool(f.app,'beta',era,'bridge_list_pending',{limit:1,cursor:first.cursor});assert.equal(second.messages.length,1);
+    assert.notEqual(first.messages[0].conversationId,second.messages[0].conversationId);
+    assert.equal('text' in first.messages[0],false);
+    const status=await tool(f.app,'beta',era,'bridge_delivery_status',{});assert.equal(status.deliveries.length,2);
+    assert.equal(status.deliveries[0].processing,'unconfirmed');assert.equal(status.deliveries[0].acceptanceEvidence,'unknown');
+    const foreign=await rpc(f.app,'alpha',era,'tools/call',{name:'bridge_list_pending',arguments:{cursor:first.cursor}});
+    assert.equal(foreign.body.result.isError,true);
+    const readerTools=await rpc(f.app,'reader',era,'tools/list');assert.equal(readerTools.body.result.tools.some((t:JsonRecord)=>t.name==='bridge_delivery_status'),false);
+  });
+  test(`${era}: subscription health discloses no callback or signing value and cannot expand access`,async()=>{
+    const f=await fixture();
+    await f.events.subscribe(alpha,{name:'message.received',delivery:{mode:'webhook',url:'https://callback.example.test/events',secret:webhookSecret}});
+    const health=await tool(f.app,'alpha',era,'bridge_subscription_status',{});
+    assert.equal(health.subscriptions.length,1);assert.equal(health.subscriptions[0].authorized,true);assert.equal(health.subscriptions[0].expired,false);
+    const serialized=JSON.stringify(health);assert.equal(serialized.includes(webhookSecret),false);assert.equal(serialized.includes('callback.example.test'),false);
+    assert.equal((await tool(f.app,'beta',era,'bridge_subscription_status',{})).subscriptions.length,0);
+  });
   test(`${era}: SDK discovery advertises events and tools expose nonempty JSON schemas`, async () => {
     const { app } = await fixture();
     const discovery = await rpc(app, 'alpha', era, era === 'legacy' ? 'initialize' : 'server/discover', era === 'legacy' ? {
