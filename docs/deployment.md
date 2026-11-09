@@ -132,7 +132,7 @@ DynamoDB transaction permissions use the underlying item actions, not an IAM act
 
 Queue delivery uses partial batch responses; streaming retries and their failure queue are distinct from application delivery retry state. [Serverless SQS](https://www.serverless.com/framework/docs/providers/aws/events/sqs), [Serverless DynamoDB Streams](https://www.serverless.com/framework/docs/providers/aws/events/streams)
 
-The template creates two CloudWatch queue-depth alarms, but no external notification destination. Configure an approved operations destination before unattended production. Detailed API Gateway metrics are disabled to avoid per-method metric charges; basic service metrics remain available. Application message/turn limits and reserved Lambda concurrency bound normal traffic; review API Gateway throttling and an appropriate edge policy for the intended audience before exposure. A front-door policy is an installation decision, not a substitute for authentication.
+The template creates two CloudWatch queue-depth alarms, but no external notification destination. Configure an approved operations destination before unattended production. Detailed API Gateway metrics are disabled to avoid per-method metric charges; basic service metrics remain available. Application per-minute message limits and reserved Lambda concurrency bound normal traffic; review API Gateway throttling and an appropriate edge policy for the intended audience before exposure. A front-door policy is an installation decision, not a substitute for authentication.
 
 ## Event authorization and revocation
 
@@ -207,7 +207,7 @@ Durante a prova, confirme a mensagem no histórico e inspecione separadamente a 
 | A worker's lease has expired | A new worker may reserve the message; stale fences cannot publish. |
 | Repeated callback failures or terminal delivery | Inspect the delivery record without logging its secret. Resolve the recipient configuration before a deliberate replay. |
 
-History retention is independent of lease and subscription expiry. There is no automatic history deletion in this version. The installation owner must choose and approve a later archival/deletion policy. Queue retention does not delete the persisted history or outbox. DynamoDB point-in-time recovery is recovery support, not proof of a tested restore; rehearse restoration privately before depending on it.
+History visibility ends 14 days after the original message timestamp, independently of lease and subscription expiry. New rows carry `retentionExpiresAt`; physical DynamoDB cleanup is disabled until the separately reviewed [retention migration](retention.md) enables TTL. Legacy rows require an approved backfill, not an automatic retroactive deletion. Queue retention does not delete persisted rows. TTL deletion is asynchronous and does not erase PITR, snapshots, exports or already delivered copies. DynamoDB point-in-time recovery is recovery support, not proof of a tested restore; rehearse restoration privately before depending on it.
 
 ## Separate approval for access and identity
 
