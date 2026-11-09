@@ -61,7 +61,8 @@ export const privateConfigSchema=z.object({
   }).strict()).default({}),
   webhookRecipients:z.array(recipient).default([]),
   origins:z.array(httpsUrl).default([]),
-  limits:z.object({maxTurns:z.number().int().min(2).max(1000).default(20),messagesPerMinute:z.number().int().min(1).max(1000).default(30),claimMs:z.number().int().min(1000).max(900000).default(120000),maxAttempts:z.number().int().min(1).max(20).default(8)}).default({maxTurns:20,messagesPerMinute:30,claimMs:120000,maxAttempts:8}),
+  // maxTurns is a deprecated compatibility input, never an enforcement limit.
+  limits:z.object({maxTurns:z.number().int().min(2).max(1000).optional(),messagesPerMinute:z.number().int().min(1).max(1000).default(30),claimMs:z.number().int().min(1000).max(900000).default(120000),maxAttempts:z.number().int().min(1).max(20).default(8)}).default({messagesPerMinute:30,claimMs:120000,maxAttempts:8}),
 }).strict().refine(value=>value.advertisedScopes===undefined ||
   value.advertisedScopes.every(scope=>providerScopeNames(value.scopeAliases).includes(scope)),
   {message:'Advertised scopes must be configured provider scope names',path:['advertisedScopes']});

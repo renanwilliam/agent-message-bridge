@@ -2,10 +2,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { Conflict, type DueKey, type Key, type Page, type Row, type Store, type Write } from './store.js';
 import { cursorFor, readCursor, validateDue, validateKey, validateLimit, validateQuery, validateWrites } from './store-utils.js';
 
-type SqlRow = { pk: string; sk: string; version: number; value_json: string; due_at: number | null };
+type SqlRow = { pk: string; sk: string; version: number; value_json: string; due_at: number | null; retention_expires_at: number | null };
 function rowFromSql<T>(row: SqlRow): Row<T> {
   return { pk: row.pk, sk: row.sk, version: row.version, value: JSON.parse(row.value_json) as T,
-    ...(row.due_at === null ? {} : { dueAt: row.due_at }) };
+    ...(row.due_at === null ? {} : { dueAt: row.due_at }),
+    ...(row.retention_expires_at === null ? {} : { retentionExpiresAt: row.retention_expires_at }) };
 }
 function upperPrefix(prefix: string): string | undefined {
   const characters = [...prefix];
@@ -23,9 +24,22 @@ export class SqliteStore implements Store {
     this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS records (
         pk TEXT NOT NULL, sk TEXT NOT NULL, version INTEGER NOT NULL,
-        value_json TEXT NOT NULL, due_at INTEGER, PRIMARY KEY (pk, sk)
+        value_json TEXT NOT NULL, due_at INTEGER, retention_expires_at INTEGER, PRIMARY KEY (pk, sk)
       ) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS records_due ON records (due_at, pk, sk) WHERE due_at IS NOT NULL;`);
+    // Additive migration preserves pre-retention databases and their CAS versions.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const columns = this.db.prepare('PRAGMA table_info(records)').all() as { name: string }[];
+      if (!columns.some(column => column.name === 'retention_expires_at')) {
+        this.db.exec('ALTER TABLE records ADD COLUMN retention_expires_at INTEGER');
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      this.db.close();
+      throw error;
+    }
   }
   close(): void { this.db.close(); }
   async get<T = Record<string, unknown>>(key: Key): Promise<Row<T> | undefined> {
@@ -63,11 +77,11 @@ export class SqliteStore implements Store {
         if ((row?.version ?? null) !== write.expected) throw new Conflict();
       }
       const remove = this.db.prepare('DELETE FROM records WHERE pk = ? AND sk = ?');
-      const put = this.db.prepare(`INSERT INTO records (pk, sk, version, value_json, due_at) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT (pk, sk) DO UPDATE SET version = excluded.version, value_json = excluded.value_json, due_at = excluded.due_at`);
+      const put = this.db.prepare(`INSERT INTO records (pk, sk, version, value_json, due_at, retention_expires_at) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (pk, sk) DO UPDATE SET version = excluded.version, value_json = excluded.value_json, due_at = excluded.due_at, retention_expires_at = excluded.retention_expires_at`);
       for (const write of valid) {
         if (write.value === undefined) remove.run(write.pk, write.sk);
-        else put.run(write.pk, write.sk, (write.expected ?? 0) + 1, JSON.stringify(write.value), write.dueAt ?? null);
+        else put.run(write.pk, write.sk, (write.expected ?? 0) + 1, JSON.stringify(write.value), write.dueAt ?? null, write.retentionExpiresAt ?? null);
       }
       this.db.exec('COMMIT'); began = false;
     } catch (error) {

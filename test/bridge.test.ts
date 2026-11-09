@@ -1,3 +1,4 @@
+import { claimSortKey } from '../src/retention.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Bridge, type BridgeConfig } from '../src/bridge.js';
@@ -10,7 +11,7 @@ const beta: Principal = { ...alpha, id: 'beta', peers: ['alpha'] };
 const config: BridgeConfig = { maxTurns: 30, messagesPerMinute: 30, claimMs: 1000, webhookRecipients: ['team_a:beta'] };
 function fixture(overrides: Partial<BridgeConfig> = {}, store = new MemoryStore()) {
   let now = Date.UTC(2026, 0, 1);
-  return { store, bridge: new Bridge(store, { ...config, ...overrides }, () => now), now: () => now, advance: (ms: number) => { now += ms; } };
+  return { store, bridge: new Bridge(store, { ...config, ...overrides }, () => now, true), now: () => now, advance: (ms: number) => { now += ms; } };
 }
 function input(id = 'message_1', text = 'Synthetic request') { return { id, text, conversationId: 'conversation_a', recipient: 'beta' }; }
 function error(code: string) { return (value: unknown) => value instanceof BridgeError && value.code === code; }
@@ -32,7 +33,7 @@ async function terminalFixture(store = new MemoryStore(), overrides: Partial<Bri
   await f.bridge.complete(beta,{id:'reply_1',conversationId:'conversation_a',recipient:'alpha',text:'Synthetic terminal response',replyTo:'message_1',fence:requestClaim.fence!});
   const replyClaim=await f.bridge.claim(alpha,'conversation_a','reply_1');
   assert.equal(replyClaim.status,'claimed');
-  return {...f,ack:{conversationId:'conversation_a',messageId:'reply_1',fence:replyClaim.fence!},claimKey:{pk:tenantKey(alpha.tenant,'claims','conversation_a'),sk:'claim#reply_1'}};
+  return {...f,ack:{conversationId:'conversation_a',messageId:'reply_1',fence:replyClaim.fence!},claimKey:{pk:tenantKey(alpha.tenant,'claims','conversation_a'),sk:claimSortKey(await f.bridge.getMessage(alpha,'conversation_a','reply_1'))}};
 }
 
 test('same id and payload is deduplicated under concurrency; changed payload is a conflict', async () => {
@@ -85,13 +86,13 @@ test('rate limits hold under concurrency and retries do not consume another allo
   assert.equal((await bridge.send(alpha, input('next_window'))).duplicate, false);
 });
 
-test('turn limit persists across rate windows and rejects further conversation messages', async () => {
+test('deprecated turn limit is ignored across rate windows', async () => {
   const { bridge, advance } = fixture({ maxTurns: 2 });
   await bridge.send(alpha, input('first'));
   await bridge.send(alpha, input('second'));
   advance(60000);
-  await assert.rejects(bridge.send(alpha, input('third')), error('turn_limit'));
-  assert.equal((await bridge.history(alpha, 'conversation_a')).messages.length, 2);
+  assert.equal((await bridge.send(alpha, input('third'))).message.turn,3);
+  assert.equal((await bridge.history(alpha, 'conversation_a')).messages.length, 3);
 });
 
 test('identity, peer, scope and tenant boundaries prevent impersonation and history leaks', async () => {
@@ -248,7 +249,7 @@ test('ACK terminal verifica expiração após uma leitura atrasada da reserva',a
     afterClaimRead?:()=>void;
     override async get<T=Record<string,unknown>>(key:Key):Promise<Row<T>|undefined> {
       const row=await super.get<T>(key);
-      if(key.sk==='claim#reply_1'&&this.afterClaimRead){const action=this.afterClaimRead;this.afterClaimRead=undefined;action();}
+      if(key.sk.startsWith('claim#reply_1')&&this.afterClaimRead){const action=this.afterClaimRead;this.afterClaimRead=undefined;action();}
       return row;
     }
   }
@@ -307,7 +308,7 @@ for(const winner of ['ack','response'] as const) {
     const acknowledge=()=>f.bridge.acknowledge(alpha,f.ack);
     const complete=()=>f.bridge.complete(alpha,response);
     store.beforeCommit=async writes=>{
-      const target=writes.find(write=>write.sk==='claim#reply_1');
+      const target=writes.find(write=>write.sk.startsWith('claim#reply_1'));
       const value=target?.value as {outcome?:string;responseId?:string}|undefined;
       if(winner==='ack'?value?.responseId==='final_reply':value?.outcome==='acknowledged') {
         store.beforeCommit=undefined;

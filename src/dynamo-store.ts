@@ -6,7 +6,8 @@ import { cursorFor, nextRow, readCursor, validateDue, validateKey, validateLimit
 
 function decode<T>(item: Record<string, unknown>): Row<T> {
   return { pk: item.pk as string, sk: item.sk as string, version: item.version as number, value: item.value as T,
-    ...(item.dueAt === undefined ? {} : { dueAt: item.dueAt as number }) };
+    ...(item.dueAt === undefined ? {} : { dueAt: item.dueAt as number }),
+    ...(item.retentionExpiresAt === undefined ? {} : { retentionExpiresAt: item.retentionExpiresAt as number }) };
 }
 /** Base PK/SK queries are strongly consistent. The due-index is eventually consistent;
  * workers must re-read and conditionally reserve each candidate before sending it. */

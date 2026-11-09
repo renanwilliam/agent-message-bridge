@@ -14,5 +14,5 @@
     "bridge/events:subscribe": "events:subscribe"
   },
   "webhookRecipients": ["sample:agent_beta"],
-  "limits": {"maxTurns": 20, "messagesPerMinute": 30, "claimMs": 120000, "maxAttempts": 8}
+  "limits": {"messagesPerMinute": 30, "claimMs": 120000, "maxAttempts": 8}
 }

@@ -44,6 +44,7 @@ export function validateWrites(writes: Write[]): Write[] {
     validateKey(write);
     if (write.expected !== null && (!Number.isSafeInteger(write.expected) || write.expected < 1 || write.expected >= Number.MAX_SAFE_INTEGER)) throw new Error('Invalid expected version');
     if (write.dueAt !== undefined) validateDue(write.dueAt);
+    if (write.retentionExpiresAt !== undefined && (!Number.isSafeInteger(write.retentionExpiresAt) || write.retentionExpiresAt < 0)) throw new Error('Invalid retention expiration timestamp');
     const key = keyId(write);
     if (keys.has(key)) throw new Error('Duplicate key in transaction');
     keys.add(key);
@@ -60,5 +61,6 @@ export function nextRow(write: Write): Row<unknown> {
   return {
     pk: write.pk, sk: write.sk, version: (write.expected ?? 0) + 1, value: write.value,
     ...(write.dueAt === undefined ? {} : { dueAt: write.dueAt }),
+    ...(write.retentionExpiresAt === undefined ? {} : { retentionExpiresAt: write.retentionExpiresAt }),
   };
 }

@@ -1,3 +1,4 @@
+import { claimSortKey, messageExpired } from './retention.js';
 import { Conflict, type Store, type Key, type Row } from './store.js';
 import { tenantKey, validSubscriptionGeneration, type Delivery, type Subscription, type SubscriptionSecret, type OutboundPost, type EventAuthorization } from './types.js';
 import { signWebhook } from './transport.js';
@@ -9,14 +10,21 @@ export interface WorkerConfig { deliveryEnabled?: boolean; routes: Record<string
 export class Worker {
   constructor(readonly store:Store, readonly config:WorkerConfig, readonly post:OutboundPost, readonly now:()=>number=Date.now) {}
   async deliver(key:Key):Promise<string> {
+    // due() candidates may carry dueAt; never propagate it into keys or terminal writes.
+    key={pk:key.pk,sk:key.sk};
     const row=await this.store.get<Delivery>(key); const at=this.now();
     if(!row || row.value.status!=='pending' || row.dueAt===undefined || row.dueAt>at || row.value.leaseUntil>at) return 'skipped';
+    if(messageExpired(row.value.message,at)) {
+      try { await this.store.commit([{...key,expected:row.version,retentionExpiresAt:row.retentionExpiresAt,value:{...row.value,status:'dead',lastError:'message_expired',leaseUntil:0}}]); return 'expired'; }
+      catch(e) { if(e instanceof Conflict) return 'contended'; throw e; }
+    }
+    const retentionExpiresAt=row.retentionExpiresAt;
     const value={...row.value,fence:row.value.fence+1,leaseUntil:at+this.config.leaseMs};
-    try { await this.store.commit([{...key,expected:row.version,value,dueAt:value.leaseUntil}]); } catch(e) { if(e instanceof Conflict) return 'contended'; throw e; }
+    try { await this.store.commit([{...key,expected:row.version,retentionExpiresAt,value,dueAt:value.leaseUntil}]); } catch(e) { if(e instanceof Conflict) return 'contended'; throw e; }
     let leaseVersion=row.version+1;
     const finish=async(status:Delivery['status'],error?:string,dueAt?:number,attempts=value.attempts)=> {
       try {
-        await this.store.commit([{...key,expected:leaseVersion,value:{...value,status,lastError:error,leaseUntil:0,attempts},dueAt}]);
+        await this.store.commit([{...key,expected:leaseVersion,retentionExpiresAt,value:{...value,status,lastError:error,leaseUntil:0,attempts},dueAt}]);
         return status;
       } catch(e) { if(e instanceof Conflict) return 'fenced'; throw e; }
     };
@@ -38,7 +46,7 @@ export class Worker {
       headers={}; // Sign after the final authorization/rotation reads, immediately before POST.
     } else {
       // O aceite do aviso não conclui o trabalho; a claim termina por resposta ou ACK terminal com fence.
-      const claim=await this.store.get<{status:string;leaseUntil:number}>({pk:tenantKey(value.tenant,'claims',value.message.conversationId),sk:`claim#${value.message.id}`});
+      const claim=await this.store.get<{status:string;leaseUntil:number}>({pk:tenantKey(value.tenant,'claims',value.message.conversationId),sk:claimSortKey(value.message)});
       if(claim?.value.status==='done') return finish('done');
       if(claim && claim.value.leaseUntil>at) return finish('pending',undefined,claim.value.leaseUntil+1);
       const route=this.config.routes[`${value.tenant}:${value.owner}`];
@@ -55,7 +63,7 @@ export class Worker {
     // after a successful POST must not reset the bounded retry budget.
     const attempted={...value,attempts,leaseUntil:this.now()+this.config.leaseMs};
     try {
-      await this.store.commit([{...key,expected:leaseVersion,value:attempted,dueAt:attempted.leaseUntil}]);
+      await this.store.commit([{...key,expected:leaseVersion,retentionExpiresAt,value:attempted,dueAt:attempted.leaseUntil}]);
     } catch(e) { if(e instanceof Conflict) return 'fenced'; throw e; }
     leaseVersion++;
     Object.assign(value,attempted);
@@ -76,6 +84,7 @@ export class Worker {
       catch {return finish('dead','subscription_secret_invalid');}
       url=signing.value.url;
     }
+    if(messageExpired(value.message,this.now())) return finish('dead','message_expired');
     try {
       const response=await this.post(url,body,headers);
       if(response.status>=200 && response.status<300) {
