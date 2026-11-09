@@ -170,6 +170,10 @@ resources:
     HasProcessingMonitor:
       Fn::Not:
         - Fn::Equals: ["${param:processingMonitorName, ''}", '']
+    HasProcessingClaimsMonitor:
+      Fn::And:
+        - Condition: HasProcessingMonitor
+        - Fn::Equals: ["${param:processingClaimsExpected, 'false'}", 'true']
   Resources:
     BridgeTable:
       Type: AWS::DynamoDB::Table
@@ -270,6 +274,7 @@ resources:
                   - ${param:installationId}#rate#*
                   - ${param:installationId}#subscriptions#*
                   - ${param:installationId}#subscription-secrets#*
+                  - ${param:installationId}#inbox#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
             - Effect: Allow
@@ -309,6 +314,19 @@ resources:
                 ForAnyValue:StringEquals:
                   dynamodb:EnclosingOperation:
                   - TransactWriteItems
+            # Separate activation approval required: confirmed inbox pointers only.
+            - Effect: Allow
+              Action: dynamodb:DeleteItem
+              Resource:
+                Fn::GetAtt: [BridgeTable, Arn]
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#inbox#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+                ForAnyValue:StringEquals:
+                  dynamodb:EnclosingOperation: [TransactWriteItems]
     IngressRole:
       Type: AWS::IAM::Role
       Properties:
@@ -344,6 +362,7 @@ resources:
                   - ${param:installationId}#dedup#*
                   - ${param:installationId}#rate#*
                   - ${param:installationId}#subscriptions#*
+                  - ${param:installationId}#inbox#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
             - Effect: Allow
@@ -382,6 +401,18 @@ resources:
                 ForAnyValue:StringEquals:
                   dynamodb:EnclosingOperation:
                   - TransactWriteItems
+            - Effect: Allow
+              Action: dynamodb:DeleteItem
+              Resource:
+                Fn::GetAtt: [BridgeTable, Arn]
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                  - ${param:installationId}#inbox#*
+                'Null':
+                  dynamodb:LeadingKeys: 'false'
+                ForAnyValue:StringEquals:
+                  dynamodb:EnclosingOperation: [TransactWriteItems]
     HistoryRole:
       Type: AWS::IAM::Role
       Properties:
@@ -680,9 +711,9 @@ resources:
         AlarmActions: *alarmActions
     UnconfirmedProcessingAlarm:
       Type: AWS::CloudWatch::Alarm
-      Condition: HasProcessingMonitor
+      Condition: HasProcessingClaimsMonitor
       Properties:
-        AlarmDescription: Accepted deliveries have no confirmed processing evidence
+        AlarmDescription: Overdue accepted deliveries have no running or confirmed processing claim
         Namespace: AgentMessageBridge
         MetricName: AcceptedUnconfirmed
         Dimensions: *monitorDimensions

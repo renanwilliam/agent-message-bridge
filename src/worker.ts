@@ -92,7 +92,8 @@ export class Worker {
       const response=await this.post(url,body,headers);
       if(response.status>=200 && response.status<300) {
         if(mcpResponseFailed(response.body))return finish(attempts>=this.config.maxAttempts?'dead':'pending','mcp_error',attempts>=this.config.maxAttempts?undefined:this.now()+this.backoff(attempts),attempts);
-        value.acceptedAt=this.now(); value.processing='unconfirmed';
+        // Preserve first acceptance so repeated webhook receipts cannot renew alert grace.
+        value.acceptedAt??=this.now(); value.processing='unconfirmed';
         return value.kind==='event'?finish('done',undefined,undefined,attempts):finish('pending',undefined,this.now()+this.config.responseWaitMs,attempts);
       }
       const permanent=response.status>=400 && response.status<500 && ![408,425,429].includes(response.status);

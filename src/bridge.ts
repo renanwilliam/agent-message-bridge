@@ -11,6 +11,7 @@ export interface BridgeConfig { /** @deprecated Accepted for old configurations,
 interface Conversation { participants: string[]; count: number; correlationId: string; claimFence?: number }
 interface Claim { owner: string; fence: number; leaseUntil: number; status: 'running'|'done'; responseId?: string; outcome?: 'acknowledged' }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const inboxKey=(tenant:string,message:MessageNotice)=>({pk:tenantKey(tenant,'inbox',message.recipient),sk:`message#${message.timestamp}#${message.id}#${message.generation??'legacy'}`});
 export class Bridge {
   constructor(readonly store: Store, readonly config: BridgeConfig, readonly now: () => number = Date.now, private readonly emitMessageGeneration = EMIT_MESSAGE_GENERATION) {}
   private async retry<T>(operation: () => Promise<T>): Promise<T> {
@@ -71,12 +72,13 @@ export class Bridge {
         if(!claim || claim.value.owner!==p.id || claim.value.fence!==reservation.fence || claim.value.leaseUntil<=at || claim.value.status!=='running') throw new BridgeError('stale_claim',409);
         claimDeadline=Math.min(claim.value.leaseUntil,retentionDeadline(parent));
         writes.push({...claimKey,expected:claim.version,retentionExpiresAt:claim.retentionExpiresAt ?? retentionTTL(parent),value:{...claim.value,status:'done',responseId:input.id}});
+        writes.push(...await this.removeInbox(parent,p.tenant));
       }
       if(!Number.isSafeInteger((conv?.value.count??0)+1)) throw new BridgeError('sequence_exhausted',409);
       const message: Message={...(this.emitMessageGeneration?{generation:randomUUID()}:{}),id:input.id,conversationId:input.conversationId,correlationId:conv?.value.correlationId??input.id,sender:p.id,recipient:input.recipient,text:input.text,timestamp:new Date(at).toISOString(),turn:(conv?.value.count??0)+1,...(input.replyTo?{replyTo:input.replyTo}:{})};
       const {text: _text,turn: _turn,replyTo: _replyTo,...notice}=message;
       // Recipient discovery is independent of callback availability and subscription filters.
-      if(this.config.inboxEnabled)writes.push({pk:tenantKey(p.tenant,'inbox',message.recipient),sk:`message#${message.timestamp}#${message.id}#${message.generation??'legacy'}`,expected:null,retentionExpiresAt:retentionTTL(message),value:notice});
+      if(this.config.inboxEnabled)writes.push({...inboxKey(p.tenant,message),expected:null,retentionExpiresAt:retentionTTL(message),value:notice});
       writes.push({pk,sk:'meta',expected:conv?.version??null,value:{...(conv?conv.value:{claimFence:0}),participants:conv?.value.participants??[p.id,input.recipient],count:message.turn,correlationId:message.correlationId}},
         {pk:historyPk,sk:`message#${message.turn<10_000_000_000?String(message.turn).padStart(10,'0'):'~'+String(message.turn).padStart(16,'0')}#${message.id}`,expected:null,retentionExpiresAt:retentionTTL(message),value:message},
         {pk:historyPk,sk:`id#${message.id}`,expected:null,retentionExpiresAt:retentionTTL(message),value:message},
@@ -127,6 +129,7 @@ export class Bridge {
   }
   async deliveries(p:Principal,limit=30,cursor?:string) {
     requireScope(p,'messages:read'); requireScope(p,'messages:claim');
+    if(!this.config.inboxEnabled)throw new BridgeError('inbox_not_enabled',503);
     const page=await this.store.query<Delivery>(tenantKey(p.tenant,'outbox',p.id),'',limit,cursor);
     const deliveries=[];
     for(const row of page.items) {
@@ -143,6 +146,11 @@ export class Bridge {
         acceptanceEvidence:value.acceptedAt!==undefined?'recorded':'unknown'});
     }
     return {deliveries,...(page.cursor?{cursor:page.cursor}:{})};
+  }
+  async probePreflight(p:Principal) {
+    requireScope(p,'messages:send'); requireScope(p,'messages:read'); requireScope(p,'messages:claim');
+    return {sender:p.id,webhookConfigured:this.config.webhookRecipients.includes(`${p.tenant}:${p.id}`),
+      activeSubscriptions:(await activeSubscriptions(this.store,p.tenant,p.id,this.now())).length};
   }
   async getMessage(p:Principal,conversationId:string,messageId:string) {
     if(!p.scopes.includes('history:read')) requireScope(p,'messages:read'); await this.conversation(p,conversationId);
@@ -189,6 +197,12 @@ export class Bridge {
     if(!Number.isSafeInteger(input.fence) || input.fence<1) throw new BridgeError('invalid_fence');
     return this.publish(p,input,{messageId:id(input.replyTo),fence:input.fence});
   }
+  private async removeInbox(message:Message,tenant:string):Promise<Write[]> {
+    if(!this.config.inboxEnabled)return [];
+    const key=inboxKey(tenant,message);
+    const row=await this.store.get<MessageNotice>(key);
+    return row?[{...key,expected:row.version}]:[];
+  }
   async acknowledge(p:Principal,input:{conversationId:string;messageId:string;fence:number}) {
     requireScope(p,'messages:claim');
     if(!Number.isSafeInteger(input.fence) || input.fence<1) throw new BridgeError('invalid_fence');
@@ -208,7 +222,9 @@ export class Bridge {
       }
       if(row.value.status!=='running' || row.value.leaseUntil<=this.now()) throw new BridgeError('stale_claim',409);
       const value:Claim={owner:p.id,fence:input.fence,leaseUntil:0,status:'done',outcome:'acknowledged'};
-      await this.store.commit([{...key,expected:row.version,retentionExpiresAt:row?.retentionExpiresAt ?? retentionTTL(message),value}]);
+      const inboxWrites=await this.removeInbox(message,p.tenant);
+      if(messageExpired(message,this.now()) || row.value.leaseUntil<=this.now())throw new BridgeError('stale_claim',409);
+      await this.store.commit([{...key,expected:row.version,retentionExpiresAt:row?.retentionExpiresAt ?? retentionTTL(message),value},...inboxWrites]);
       return {...result,duplicate:false};
     });
   }

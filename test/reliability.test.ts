@@ -9,6 +9,7 @@ import { deliveryMetric } from '../src/observability.js';
 import { mcpResponseFailed } from '../src/delivery-response.js';
 import { mapBounded } from '../src/concurrency.js';
 import { createDeliveryHandler } from '../src/delivery-handler.js';
+import { processingSnapshot } from '../scripts/processing-monitor.js';
 import { HISTORY_RETENTION_MS } from '../src/retention.js';
 import { type Delivery, type Principal, tenantKey } from '../src/types.js';
 import type { Store, Write } from '../src/store.js';
@@ -22,7 +23,7 @@ function fixture(store:Store=new MemoryStore()) {
   return {store,bridge,now:()=>now,advance:(ms:number)=>{now+=ms;},send:(id='request',conversationId='conversation')=>bridge.send(alpha,{id,conversationId,recipient:'beta',text:'Synthetic request'})};
 }
 for(const [name,make] of [['memory',()=>new MemoryStore()],['sqlite',()=>new SqliteStore(':memory:')]] as const) {
-  test(`${name}: inbox covers conversations without subscriptions and completed empty pages keep cursors`,async()=>{
+  test(`${name}: inbox covers conversations and removes completed pointers without losing pagination`,async()=>{
     const f=fixture(make());
     await Promise.all([f.send('first','one'),f.send('second','two')]);
     const pointers=await f.store.query(tenantKey('sample','inbox','beta'),'message#',100);
@@ -31,8 +32,9 @@ for(const [name,make] of [['memory',()=>new MemoryStore()],['sqlite',()=>new Sql
     const msg=first.messages[0]!;assert.equal('text' in msg,false);
     const c=await f.bridge.claim(beta,msg.conversationId,msg.id);assert.equal(c.status,'claimed');
     await f.bridge.complete(beta,{id:'reply',conversationId:msg.conversationId,recipient:'alpha',text:'Synthetic response',replyTo:msg.id,fence:c.fence!});
-    const empty=await f.bridge.pending(beta,1);assert.equal(empty.messages.length,0);assert.ok(empty.cursor);
-    const next=await f.bridge.pending(beta,1,empty.cursor);assert.equal(next.messages.length,1);
+    const remaining=await f.bridge.pending(beta,1);assert.equal(remaining.messages.length,1);
+    const next=await f.bridge.pending(beta,1,first.cursor);assert.equal(next.messages.length,1);
+    assert.equal((await f.store.query(tenantKey('sample','inbox','beta'),'message#',100)).items.length,1);
     assert.equal((await f.bridge.pending({...beta,id:'other'})).messages.length,0);
     await assert.rejects(f.bridge.pending({...beta,tenant:'other'},1,next.cursor??first.cursor));
     await assert.rejects(f.bridge.pending({...beta,scopes:['messages:read']}),/forbidden/);
@@ -51,7 +53,53 @@ test('inbox insertion is atomic and compatibility gate preserves the old role co
   const old=new Bridge(store,{...config,inboxEnabled:false},f.now);
   await old.send(alpha,{id:'old',conversationId:'legacy',recipient:'beta',text:'Synthetic legacy'});
   await assert.rejects(old.pending(beta),/inbox_not_enabled/);
+  await assert.rejects(old.deliveries(beta),/inbox_not_enabled/);
   assert.equal((await f.bridge.pending(beta)).messages.length,1,'Legacy publications require reviewed backfill');
+});
+test('inbox removal is atomic with completion; a failed delete leaves the original claim and work recoverable',async()=>{
+  class FailingStore extends MemoryStore {
+    rejectDeletes=false;
+    override async commit(writes:Write[]) {
+      if(this.rejectDeletes&&writes.some(write=>write.pk.includes('#inbox#')&&write.value===undefined))throw new Error('injected_delete_denial');
+      return super.commit(writes);
+    }
+  }
+  const store=new FailingStore(),f=fixture(store);await f.send();
+  const c=await f.bridge.claim(beta,'conversation','request');
+  const reply={id:'reply',conversationId:'conversation',recipient:'alpha',text:'Synthetic response',replyTo:'request',fence:c.fence!};
+  store.rejectDeletes=true;await assert.rejects(f.bridge.complete(beta,reply),/injected_delete_denial/);
+  assert.equal((await f.bridge.pending(beta)).messages[0]!.processing,'running');
+  assert.equal((await f.bridge.history(beta,'conversation')).messages.length,1);
+  store.rejectDeletes=false;await f.bridge.complete(beta,reply);
+  assert.equal((await f.store.query(tenantKey('sample','inbox','beta'),'message#',100)).items.length,0);
+  const terminal=await f.bridge.claim(alpha,'conversation','reply');
+  const args={conversationId:'conversation',messageId:'reply',fence:terminal.fence!};
+  store.rejectDeletes=true;await assert.rejects(f.bridge.acknowledge(alpha,args),/injected_delete_denial/);
+  assert.equal((await f.bridge.pending(alpha)).messages[0]!.processing,'running');
+  store.rejectDeletes=false;await f.bridge.acknowledge(alpha,args);
+  assert.equal((await f.store.query(tenantKey('sample','inbox','alpha'),'message#',100)).items.length,0);
+  assert.equal((await f.bridge.acknowledge(alpha,args)).duplicate,true);
+});
+test('completed traffic leaves no inbox read amplification while history and TTL evidence remain intact',async()=>{
+  class CountingStore extends MemoryStore {
+    reads=0;
+    override async get<T=Record<string,unknown>>(key:{pk:string;sk:string}) {this.reads++;return super.get<T>(key);}
+  }
+  const store=new CountingStore(),now=()=>Date.UTC(2026,0,1);
+  const bridge=new Bridge(store,{...config,messagesPerMinute:1000,webhookRecipients:[]},now);
+  for(let n=0;n<125;n++) {
+    await bridge.send(alpha,{id:`request_${n}`,conversationId:'volume',recipient:'beta',text:'Synthetic request'});
+    const c=await bridge.claim(beta,'volume',`request_${n}`);
+    await bridge.complete(beta,{id:`reply_${n}`,conversationId:'volume',recipient:'alpha',text:'Synthetic response',replyTo:`request_${n}`,fence:c.fence!});
+    const terminal=await bridge.claim(alpha,'volume',`reply_${n}`);
+    await bridge.acknowledge(alpha,{conversationId:'volume',messageId:`reply_${n}`,fence:terminal.fence!});
+  }
+  store.reads=0;
+  assert.equal((await bridge.pending(beta)).messages.length,0);assert.equal((await bridge.pending(alpha)).messages.length,0);
+  assert.equal(store.reads,0,'Completed pointers are deleted, not re-read and filtered');
+  const history=await store.query(tenantKey('sample','history','volume'),'message#',100);
+  assert.equal(history.items.length,100);assert.ok(history.cursor);
+  assert.ok(history.items.every(row=>row.retentionExpiresAt===(now()+HISTORY_RETENTION_MS)/1000));
 });
 test('2xx without processing stays unconfirmed; expired claims are discoverable without resending accepted events',async()=>{
   const f=fixture();await f.send();let posts=0;
@@ -72,7 +120,7 @@ test('2xx without processing stays unconfirmed; expired claims are discoverable 
   status=(await f.bridge.deliveries(beta)).deliveries[0]!;assert.equal(status.processing,'confirmed');
   assert.equal((await f.bridge.pending(beta)).messages.length,0);
 });
-for(const body of ['{"error":{"code":-32603,"message":"private-error"}}','{"isError":true}','{"result":{"isError":true}}','[{"result":{}},{"error":{"code":-1}}]']) {
+for(const body of ['{"jsonrpc":"2.0","error":{"code":-32603,"message":"private-error"}}','{"jsonrpc":"2.0","result":{"isError":true}}','[{"jsonrpc":"2.0","result":{}},{"jsonrpc":"2.0","error":{"code":-1}}]']) {
   test(`MCP errors inside HTTP 200 consume bounded retries without storing response text (${body.slice(0,20)})`,async()=>{
     const f=fixture();await f.send();let posts=0;
     const worker=new Worker(f.store,workerConfig,async()=>{posts++;return {status:200,body};},f.now);
@@ -85,8 +133,19 @@ for(const body of ['{"error":{"code":-32603,"message":"private-error"}}','{"isEr
   });
 }
 test('callback compatibility accepts empty, arbitrary receipt, and successful JSON-RPC bodies as transport receipts only',()=>{
-  for(const body of ['', 'accepted','{}','{"result":{}}','{"error":null}'])assert.equal(mcpResponseFailed(body),false);
+  for(const body of ['', 'accepted','{}','{"result":{}}','{"error":null}','{"ok":true,"error":false}','{"ok":true,"error":""}','{"isError":true}','{"error":{"reason":"domain_field"}}','{"jsonrpc":"2.0","error":false}','{"jsonrpc":"2.0","error":[]}','{"jsonrpc":"2.0","result":{"isError":false}}'])assert.equal(mcpResponseFailed(body),false);
 });
+for(const error of [false,'']) {
+  test(`HTTP 200 webhook receipt with error=${JSON.stringify(error)} records acceptance rather than an MCP retry`,async()=>{
+    const f=fixture();await f.send();let posts=0;
+    const worker=new Worker(f.store,workerConfig,async()=>{posts++;return {status:200,body:JSON.stringify({ok:true,error})};},f.now);
+    const key=(await f.store.due(f.now(),10))[0]!;
+    assert.equal(await worker.deliver(key),'pending');f.advance(101);
+    assert.equal(await worker.deliver(key),'skipped');assert.equal(posts,1);
+    const row=(await f.store.get<Delivery>(key))!;
+    assert.equal(row.value.lastError,undefined);assert.equal(row.value.acceptedAt,f.now()-101);
+  });
+}
 test('dead recovery preserves TTL/identity, requires reviewed version and serializes with concurrent claims',async()=>{
   const f=fixture();await f.send();
   const key=(await f.store.due(f.now(),10))[0]!;
@@ -135,6 +194,9 @@ test('accepted delivery exhausted as dead is recovered through inbox claim, not 
   await f.bridge.complete(beta,{id:'late_reply',conversationId:'conversation',recipient:'alpha',text:'Synthetic',replyTo:'request',fence:c.fence!});
   assert.equal((await f.bridge.pending(beta)).messages.length,0);
   const state=(await f.bridge.deliveries(beta)).deliveries[0]!;assert.equal(state.status,'dead');assert.equal(state.processing,'confirmed');
+  const snapshot=await processingSnapshot(async(name,args)=>name==='bridge_list_pending'?f.bridge.pending(beta,args.limit as number,args.cursor as string|undefined):f.bridge.deliveries(beta,args.limit as number,args.cursor as string|undefined),{claimsExpected:true},f.now());
+  assert.ok(snapshot.complete);if(!snapshot.complete)throw new Error('incomplete');
+  assert.equal(snapshot.DeadDeliveries,0);assert.equal(snapshot.AcceptedUnconfirmed,0);
   assert.equal(await worker.deliver(key),'skipped');assert.equal(posts,2);
 });
 test('EMF signals dead independently of DLQ and never includes private metadata or untrusted errors',()=>{

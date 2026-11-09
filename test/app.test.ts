@@ -90,6 +90,17 @@ function message(id = 'message_1', conversationId = 'conversation_1') {
 }
 
 for (const era of ['legacy', 'modern'] as const) {
+  test(`${era}: probe preflight uses existing scopes and reveals only the current sender delivery configuration`,async()=>{
+    const f=await fixture();
+    const bearer=await token('alpha','messages:send messages:read messages:claim');
+    assert.deepEqual(await tool(f.app,'alpha',era,'bridge_probe_preflight',{},bearer),{sender:'alpha',webhookConfigured:false,activeSubscriptions:0});
+    await f.events.subscribe(alpha,{name:'message.received',delivery:{mode:'webhook',url:'https://callback.example.test/events',secret:webhookSecret}});
+    assert.deepEqual(await tool(f.app,'alpha',era,'bridge_probe_preflight',{},bearer),{sender:'alpha',webhookConfigured:false,activeSubscriptions:1});
+    assert.deepEqual(await tool(f.app,'beta',era,'bridge_probe_preflight',{}),{sender:'beta',webhookConfigured:true,activeSubscriptions:0});
+    const missingScope=await token('alpha','messages:send messages:read');
+    const tools=await rpc(f.app,'alpha',era,'tools/list',{},missingScope);
+    assert.equal(tools.body.result.tools.some((item:JsonRecord)=>item.name==='bridge_probe_preflight'),false);
+  });
   test(`${era}: inbox/status tools are gated, authenticated and support recipient-wide discovery`,async()=>{
     const f=await fixture();
     const disabled=await rpc(f.app,'beta',era,'tools/list');
@@ -307,6 +318,26 @@ test('signed peer callback rejects wrong signer before storage and distinguishes
   assert.equal((await bridge.history(alpha, 'peer_conversation')).messages.length, 1);
   const tampered = await app.fetch(new Request('https://bridge.example.test/peer', { method: 'POST', body: body + ' ', headers: { ...signWebhook(webhookSecret, 'delivery_tamper', body), 'x-bridge-key-id': 'peer_beta' } }));
   assert.equal(tampered.status, 401);
+});
+test('signed peer pending and deliveries honor the disabled-inbox gate without querying data',async()=>{
+  const f=await fixture();let queries=0;
+  f.store.query=async()=>{queries++;throw new Error('must_not_query');};
+  for(const action of ['pending','deliveries']) {
+    const raw=JSON.stringify({action,arguments:{}});
+    const response=await f.app.fetch(new Request('https://bridge.example.test/peer',{method:'POST',body:raw,
+      headers:{...signWebhook(webhookSecret,`disabled_${action}`,raw),'x-bridge-key-id':'peer_beta'}}));
+    assert.equal(response.status,503);assert.deepEqual(await response.json(),{error:'inbox_not_enabled'});
+  }
+  assert.equal(queries,0);
+});
+test('signed peer has an explicit allowlist and does not inherit MCP-only actions',async()=>{
+  const f=await fixture();
+  for(const action of ['subscription_status','probe_preflight','future_action']) {
+    const raw=JSON.stringify({action,arguments:{}});
+    const response=await f.app.fetch(new Request('https://bridge.example.test/peer',{method:'POST',body:raw,
+      headers:{...signWebhook(webhookSecret,`forbidden_${action}`,raw),'x-bridge-key-id':'peer_beta'}}));
+    assert.equal(response.status,400);assert.deepEqual(await response.json(),{error:'invalid_arguments'});
+  }
 });
 
 test('ACK assinado mantém autenticação e distingue replay do envelope de retry idempotente', async () => {

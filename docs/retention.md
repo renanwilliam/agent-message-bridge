@@ -14,7 +14,7 @@ The optional **top-level** `retentionExpiresAt` is a nonnegative integer Unix ti
 | sender dedup | Original message +14 days | No expired text replay; terminal 410 when reference/expired row remains |
 | claims, running and done | Parent message +14 days | Cannot claim, complete or acknowledge an expired parent; lease capped at deadline |
 | outbox, pending/done/dead | Source message +14 days | No new POST after deadline check; expired pending rows become dead with no `dueAt` |
-| inbox, when enabled | Source message +14 days | Pending discovery filters original logical expiry and completed claims; no message text |
+| inbox, when enabled | Source message +14 days if unfinished | Removed atomically on complete/terminal ACK; otherwise logical expiry filters discovery; no message text |
 | rate counters | End of their minute window +14 days | Existing minute-based rate enforcement unchanged |
 | conversation `meta` | **No TTL** | Minimal participants/ACL, original correlation identifier, turn count and global fence counter remain |
 | authorization, grants, subscriptions, signing secrets, callback anti-replay | **No change** | Existing security lifecycle remains, separately governed |

@@ -14,8 +14,8 @@ const require = createRequire(import.meta.url);
 const { validateDeployment }: { validateDeployment: (config: Obj) => void } = require('../scripts/deployment-preflight.cjs');
 
 const namespaceContract: Record<string, Record<string, string[]>> = {
-  McpRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','subscription-secrets'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','subscriptions','subscription-secrets']},
-  IngressRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','callback']},
+  McpRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','subscription-secrets','inbox'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','subscriptions','subscription-secrets'],DeleteItem:['inbox']},
+  IngressRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','inbox'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','callback'],DeleteItem:['inbox']},
   HistoryRole: {GetItem:['meta'],Query:['history']},
   DeliveryRole: {GetItem:['outbox','claims','subscriptions','subscription-secrets'],PutItem:['outbox']},
 };
@@ -33,7 +33,7 @@ function assertDataIsolation(all: Obj, installationId: string) {
       assert.deepEqual(statement.Resource, {'Fn::GetAtt':['BridgeTable','Arn']});
       assert.deepEqual(statement.Condition['ForAllValues:StringLike']['dynamodb:LeadingKeys'], contract[action]!.map(ns => `${installationId}#${ns}#*`));
       assert.equal(statement.Condition.Null['dynamodb:LeadingKeys'], 'false');
-      if (action === 'PutItem') assert.deepEqual(statement.Condition['ForAnyValue:StringEquals']['dynamodb:EnclosingOperation'], ['TransactWriteItems']);
+      if (action === 'PutItem' || action === 'DeleteItem') assert.deepEqual(statement.Condition['ForAnyValue:StringEquals']['dynamodb:EnclosingOperation'], ['TransactWriteItems']);
     }
   }
   for (const [role, group] of Object.entries(logGroups)) {
@@ -133,11 +133,12 @@ test('dead-delivery and DLQ alarms share an optional operator-approved destinati
   assert.deepEqual(resources.DeadDeliveryAlarm.Properties.Dimensions,[{Name:'FunctionName',Value:{Ref:'DeliveryLambdaFunction'}}]);
   assert.equal(Object.values(resources).some((r:any)=>r.Type==='AWS::SNS::Topic'||r.Type==='AWS::SNS::Subscription'),false);
   for(const name of ['OldPendingAlarm','UnconfirmedProcessingAlarm','DeadBacklogAlarm','SubscriptionHealthAlarm','ProcessingMonitorMissingAlarm']) {
-    assert.equal(resources[name].Condition,'HasProcessingMonitor');
+    assert.equal(resources[name].Condition,name==='UnconfirmedProcessingAlarm'?'HasProcessingClaimsMonitor':'HasProcessingMonitor');
     assert.deepEqual(resources[name].Properties.AlarmActions,actions);
     assert.deepEqual(resources[name].Properties.Dimensions,[{Name:'Monitor',Value:"${param:processingMonitorName, ''}"}]);
   }
   assert.equal(resources.ProcessingMonitorMissingAlarm.Properties.TreatMissingData,'breaching');
+  assert.deepEqual(manifest.resources.Conditions.HasProcessingClaimsMonitor,{'Fn::And':[{Condition:'HasProcessingMonitor'},{'Fn::Equals':["${param:processingClaimsExpected, 'false'}",'true']}]});
 });
 
 test('deployment archive excludes local secrets, histories, examples and preflight source', () => {

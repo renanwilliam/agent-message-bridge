@@ -9,7 +9,7 @@ import { validateCallbackUrl } from '../src/transport.js';
 import { mcpResponseFailed } from '../src/delivery-response.js';
 
 const identifier=z.string().regex(/^[A-Za-z0-9_-]{1,100}$/);
-const configSchema=z.object({resourceUrl:z.string(),conversationId:identifier,recipient:identifier,effectUrl:z.string().optional(),waitMs:z.number().int().min(1000).max(180000).default(60000)}).strict();
+const configSchema=z.object({resourceUrl:z.string(),conversationId:identifier,recipient:identifier,sender:identifier,exclusiveSender:z.literal(true),effectUrl:z.string().optional(),waitMs:z.number().int().min(1000).max(180000).default(60000)}).strict();
 export type ProbeConfig=z.input<typeof configSchema>;
 type Result=Record<string,any>;
 export type ToolCall=(name:string,args:Record<string,unknown>)=>Promise<Result>;
@@ -18,12 +18,14 @@ export async function probe(config:ProbeConfig,commit:string,call:ToolCall,verif
   now=Date.now,pause:(ms:number)=>Promise<void>=ms=>new Promise(resolve=>setTimeout(resolve,ms))) {
   const c=configSchema.parse(config);
   if(!/^[a-f0-9]{40}$/.test(commit))throw new Error('invalid_release_commit');
+  const preflight=await call('bridge_probe_preflight',{});
+  if(preflight.sender!==c.sender || c.sender===c.recipient || preflight.webhookConfigured!==false || preflight.activeSubscriptions!==0)throw new Error('probe_sender_not_isolated');
   // One logical probe per release and approved conversation, including resumed jobs.
-  const runId=`probe_${createHash('sha256').update(JSON.stringify([commit,c.resourceUrl,c.conversationId,c.recipient])).digest('hex').slice(0,32)}`;
+  const runId=`probe_${createHash('sha256').update(JSON.stringify([commit,c.resourceUrl,c.conversationId,c.recipient,c.sender])).digest('hex').slice(0,32)}`;
   const requestId=`${runId}_request`;
   const sent=await call('bridge_send_message',{id:requestId,conversationId:c.conversationId,recipient:c.recipient,
     text:JSON.stringify({type:'synthetic_bridge_probe',runId,request:'Process once using claim and complete. Record one synthetic effect in the authorized probe ledger. No other external action.'})});
-  if(sent.message?.id!==requestId||sent.message?.conversationId!==c.conversationId||sent.message?.recipient!==c.recipient)throw new Error('probe_persistence_mismatch');
+  if(sent.message?.id!==requestId||sent.message?.conversationId!==c.conversationId||sent.message?.recipient!==c.recipient||sent.message?.sender!==c.sender)throw new Error('probe_persistence_mismatch');
   const deadline=now()+c.waitMs;
   let response:Result|undefined;
   let evidence=false;

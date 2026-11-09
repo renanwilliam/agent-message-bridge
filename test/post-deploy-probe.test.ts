@@ -4,7 +4,7 @@ import { probe, mcpCaller, main } from '../scripts/post-deploy-probe.js';
 import { Bridge } from '../src/bridge.js';
 import { MemoryStore } from '../src/memory-store.js';
 import { type Principal } from '../src/types.js';
-const config={resourceUrl:'https://bridge.example.test/bridge/mcp',conversationId:'probe_conversation',recipient:'beta',waitMs:1000};
+const config={resourceUrl:'https://bridge.example.test/bridge/mcp',conversationId:'probe_conversation',recipient:'beta',sender:'alpha',exclusiveSender:true as const,waitMs:1000};
 const commit='a'.repeat(40);
 function fixture() {
   const store=new MemoryStore();let clock=Date.UTC(2026,0,1),effects=0;
@@ -20,6 +20,7 @@ function fixture() {
   };
   const call=async(name:string,args:Record<string,unknown>)=>{
     switch(name) {
+      case 'bridge_probe_preflight':return bridge.probePreflight(alpha);
       case 'bridge_send_message':return bridge.send(alpha,args as any);
       case 'bridge_read_history':return bridge.history(alpha,args.conversationId as string,args.limit as number,args.cursor as string|undefined);
       case 'bridge_claim_message':return bridge.claim(alpha,args.conversationId as string,args.messageId as string);
@@ -49,7 +50,7 @@ test('processing without an independent effect ledger is explicitly partial',asy
 test('receiver response without matching effect evidence never passes',async()=>{
   const f=fixture();await assert.rejects(probe({...config,waitMs:2000},commit,f.call,async()=>false,f.now,f.pause),/effect_not_confirmed/);
 });
-for(const raw of ['{"jsonrpc":"2.0","error":{"code":-32603,"message":"private"}}','{"result":{"isError":true,"content":[]}}']) {
+for(const raw of ['{"jsonrpc":"2.0","error":{"code":-32603,"message":"private"}}','{"jsonrpc":"2.0","result":{"isError":true,"content":[]}}']) {
   test('probe rejects MCP failure hidden behind HTTP 200 without reflecting response text',async()=>{
     const call=mcpCaller(config.resourceUrl,'synthetic-token',async()=>new Response(raw,{status:200}) as any);
     await assert.rejects(call('bridge_send_message',{}),/probe_mcp_error/);
@@ -59,4 +60,30 @@ test('CI without approved probe credentials reports partial, without creating cr
   const lines:string[]=[];const log=console.log;
   try {console.log=(value:string)=>{lines.push(value);};await main({CI:'true'});}finally{console.log=log;}
   assert.deepEqual(JSON.parse(lines[0]!),{status:'partial',reason:'authorized_probe_configuration_missing',processingConfirmed:false});
+});
+test('probe rejects a shared webhook sender before sending any message',async()=>{
+  const f=fixture();f.bridge.config.webhookRecipients.push('sample:alpha');let sent=false;
+  await assert.rejects(probe(config,commit,async(name,args)=>{if(name==='bridge_send_message')sent=true;return f.call(name,args);},undefined,f.now,f.pause),/probe_sender_not_isolated/);
+  assert.equal(sent,false);assert.equal(f.effects(),0);
+});
+test('probe rejects active subscriptions or a mismatched sender before sending',async()=>{
+  for(const preflight of [{sender:'alpha',webhookConfigured:false,activeSubscriptions:1},{sender:'other',webhookConfigured:false,activeSubscriptions:0}]) {
+    let sent=false;
+    await assert.rejects(probe(config,commit,async(name)=>{if(name==='bridge_probe_preflight')return preflight;sent=true;throw new Error('unexpected_send');},undefined),/probe_sender_not_isolated/);
+    assert.equal(sent,false);
+  }
+});
+test('probe requires explicit exclusive consumer reservation before making calls',async()=>{
+  let calls=0;
+  await assert.rejects(probe({...config,exclusiveSender:undefined} as any,commit,async()=>{calls++;return {};},undefined));
+  assert.equal(calls,0);
+});
+test('unexpected polling contention fails without stealing or reopening the terminal claim',async()=>{
+  const f=fixture();let claims=0;
+  const call=async(name:string,args:Record<string,unknown>)=>{
+    if(name==='bridge_claim_message'){claims++;return {status:'busy',retryAfter:f.now()+1000};}
+    return f.call(name,args);
+  };
+  await assert.rejects(probe(config,commit,call,undefined,f.now,f.pause),/probe_terminal_claim_uncertain/);
+  assert.equal(claims,1);assert.equal(f.effects(),1);
 });

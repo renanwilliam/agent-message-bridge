@@ -121,6 +121,7 @@ test('actual subscribe, signed ingress, fenced response, human history and deliv
     'HistoryRole:GetItem:meta','HistoryRole:Query:history',
   ]);
   assert.ok(calls.has('IngressRole:PutItem:callback'));
+  assert.ok(calls.has('McpRole:DeleteItem:inbox'));
   assert.ok(grants('DeliveryRole','GetItem',{pk:tenantKey(installation,'subscription-secrets',alpha.id),sk:'fixture'}));
   assert.ok(!calls.has('DeliveryRole:GetItem:subscription-secrets'),'Completed processing suppresses credential reads and callback delivery');
   assert.ok(![...calls].some(value=>value.startsWith('IngressRole:')&&value.endsWith(':subscription-secrets')));
@@ -144,6 +145,11 @@ test('role allowlists deny history access to claims/secrets, ingress signing sec
   }
   for(const role of ['McpRole','IngressRole','DeliveryRole']){
     assert.equal(grants(role,'PutItem',key('outbox')),false,'Writes require transactional context');
-    assert.equal(grants(role,'DeleteItem',key('outbox'),'TransactWriteItems'),false,'Runtime roles cannot delete records');
+    assert.equal(grants(role,'DeleteItem',key('outbox'),'TransactWriteItems'),false,'Runtime roles cannot delete outbox evidence');
+  }
+  for(const role of ['McpRole','IngressRole']) {
+    assert.equal(grants(role,'DeleteItem',key('inbox')),false,'Inbox deletion is transaction-only');
+    assert.equal(grants(role,'DeleteItem',key('inbox'),'TransactWriteItems'),true);
+    for(const ns of ['history','claims','dedup','meta','subscriptions'])assert.equal(grants(role,'DeleteItem',key(ns),'TransactWriteItems'),false);
   }
 });

@@ -87,6 +87,22 @@ test('accepted MCP event is explicitly unconfirmed and is not replayed merely be
   assert.equal(row.dueAt,undefined);f.advance(120000);
   assert.equal(await worker.deliver(f.key),'skipped');assert.equal(posts,1);
 });
+for(const error of [false,'']) {
+  test(`HTTP 200 event receipt with error=${JSON.stringify(error)} is accepted without duplicate delivery`,async()=>{
+    const f=await fixture('event');let posts=0;
+    const worker=f.worker(async()=>{posts++;return {status:200,body:JSON.stringify({ok:true,error})};});
+    assert.equal(await worker.deliver(f.key),'done');f.advance(120000);
+    assert.equal(await worker.deliver(f.key),'skipped');assert.equal(posts,1);
+    const row=(await f.row())!;assert.equal(row.value.acceptedAt,start);assert.equal(row.value.lastError,undefined);
+  });
+}
+test('repeated accepted webhook receipts preserve first acceptance instead of renewing confirmation grace',async()=>{
+  const f=await fixture();
+  const worker=f.worker(async()=>({status:200,body:''}));
+  await worker.deliver(f.key);f.advance(config.responseWaitMs+1);
+  await worker.deliver(f.key);
+  assert.equal((await f.row())!.value.acceptedAt,start);assert.equal((await f.row())!.value.attempts,2);
+});
 
 test('MCP event with an already completed claim is closed without another callback or secret read',async()=>{
   const f=await fixture('event');
