@@ -91,3 +91,7 @@ O código deste projeto é distribuído sob a [licença MIT](LICENSE). As depend
 ## Source contracts
 
 [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events), [Serverless AWS MCP](https://www.serverless.com/framework/docs/providers/aws/guide/mcp), [DynamoDB transactions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html), and [SQS duplicate delivery](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues-at-least-once-delivery.html).
+
+## Viewer de histórico
+
+O viewer em `/viewer` usa shadcn/ui, com navegação por conversas autorizadas, busca na conversa e atualização explícita. Consulte [contratos, limites, desenvolvimento e ativação do catálogo](docs/viewer.md). Instalações existentes precisam publicar a rota de consulta e revisar as permissões do catálogo antes da ativação; este código não realiza migração automática.

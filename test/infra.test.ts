@@ -14,9 +14,9 @@ const require = createRequire(import.meta.url);
 const { validateDeployment }: { validateDeployment: (config: Obj) => void } = require('../scripts/deployment-preflight.cjs');
 
 const namespaceContract: Record<string, Record<string, string[]>> = {
-  McpRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','subscription-secrets','inbox'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','subscriptions','subscription-secrets'],DeleteItem:['inbox']},
-  IngressRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','inbox'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','callback'],DeleteItem:['inbox']},
-  HistoryRole: {GetItem:['meta'],Query:['history']},
+  McpRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','subscription-secrets','inbox','catalog'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','catalog','subscriptions','subscription-secrets'],DeleteItem:['inbox']},
+  IngressRole: {GetItem:['meta','history','claims','dedup','rate','subscriptions','inbox','catalog'],Query:['history','inbox','outbox'],PutItem:['meta','history','claims','dedup','rate','outbox','inbox','catalog','callback'],DeleteItem:['inbox']},
+  HistoryRole: {GetItem:['meta'],Query:['history','catalog']},
   DeliveryRole: {GetItem:['outbox','claims','subscriptions','subscription-secrets'],PutItem:['outbox']},
 };
 const logGroups: Record<string,string> = {McpRole:'BridgeLogGroup',IngressRole:'IngressLogGroup',HistoryRole:'HistoryLogGroup',DeliveryRole:'DeliveryLogGroup',StreamRole:'StreamWakeLogGroup',SweepRole:'SweepLogGroup'};

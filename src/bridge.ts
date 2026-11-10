@@ -1,3 +1,4 @@
+import { queryViewer, viewerQuerySchema, type CatalogCoverage, type ConversationMetadata, type ConversationSummary } from './viewer-history.js';
 import { EMIT_MESSAGE_GENERATION } from './release-protocol.js';
 import { claimSortKey, HISTORY_RETENTION_MS, messageExpired, retentionDeadline, retentionTTL } from './retention.js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -7,8 +8,8 @@ import { BridgeError, requireScope, tenantKey, type Principal, type Message, typ
 
 const identifier = /^[a-zA-Z0-9_-]{1,100}$/;
 export function id(value: unknown): string { if (typeof value !== 'string' || !identifier.test(value)) throw new BridgeError('invalid_id'); return value; }
-export interface BridgeConfig { /** @deprecated Accepted for old configurations, ignored. */ maxTurns?: number; inboxEnabled?: boolean; messagesPerMinute: number; claimMs: number; webhookRecipients: string[] }
-interface Conversation { participants: string[]; count: number; correlationId: string; claimFence?: number }
+export interface BridgeConfig { /** @deprecated Accepted for old configurations, ignored. */ maxTurns?: number; inboxEnabled?: boolean; viewerCatalog?: CatalogCoverage; messagesPerMinute: number; claimMs: number; webhookRecipients: string[] }
+type Conversation = ConversationMetadata;
 interface Claim { owner: string; fence: number; leaseUntil: number; status: 'running'|'done'; responseId?: string; outcome?: 'acknowledged' }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const inboxKey=(tenant:string,message:MessageNotice)=>({pk:tenantKey(tenant,'inbox',message.recipient),sk:`message#${message.timestamp}#${message.id}#${message.generation??'legacy'}`});
@@ -79,7 +80,15 @@ export class Bridge {
       const {text: _text,turn: _turn,replyTo: _replyTo,...notice}=message;
       // Recipient discovery is independent of callback availability and subscription filters.
       if(this.config.inboxEnabled)writes.push({...inboxKey(p.tenant,message),expected:null,retentionExpiresAt:retentionTTL(message),value:notice});
-      writes.push({pk,sk:'meta',expected:conv?.version??null,value:{...(conv?conv.value:{claimFence:0}),participants:conv?.value.participants??[p.id,input.recipient],count:message.turn,correlationId:message.correlationId}},
+      const latest: ConversationSummary = { conversationId: input.conversationId, participants: conv?.value.participants ?? [p.id, input.recipient], timestamp: message.timestamp };
+      if (this.config.viewerCatalog && this.config.viewerCatalog !== 'disabled') {
+        for (const member of latest.participants) {
+          const key = { pk: tenantKey(p.tenant, 'catalog', member), sk: `conversation#${input.conversationId}` };
+          const previous = await this.store.get(key);
+          writes.push({ ...key, expected: previous?.version ?? null, retentionExpiresAt: retentionTTL(message), value: latest });
+        }
+      }
+      writes.push({pk,sk:'meta',expected:conv?.version??null,value:{...(conv?conv.value:{claimFence:0}),participants:conv?.value.participants??[p.id,input.recipient],count:message.turn,correlationId:message.correlationId,...(this.config.viewerCatalog && this.config.viewerCatalog !== 'disabled' ? {latest} : {})}},
         {pk:historyPk,sk:`message#${message.turn<10_000_000_000?String(message.turn).padStart(10,'0'):'~'+String(message.turn).padStart(16,'0')}#${message.id}`,expected:null,retentionExpiresAt:retentionTTL(message),value:message},
         {pk:historyPk,sk:`id#${message.id}`,expected:null,retentionExpiresAt:retentionTTL(message),value:message},
         {...dedupKey,expected:null,retentionExpiresAt:retentionTTL(message),value:{fingerprint,conversationId:message.conversationId,messageId:message.id}},
@@ -102,6 +111,9 @@ export class Bridge {
     const notice={id:message.id,conversationId:message.conversationId,correlationId:message.correlationId,sender:message.sender,recipient:message.recipient,timestamp:message.timestamp,generation:message.generation};
     const delivery:Delivery={id:eventId,kind,tenant,owner:message.recipient,message:notice,subscriptionId,subscriptionAuthorizationEpoch,subscriptionGeneration,attempts:0,fence:0,leaseUntil:0,status:'pending'};
     return {pk:tenantKey(tenant,'outbox',message.recipient),sk:eventId,expected:null,retentionExpiresAt:retentionTTL(message),value:delivery,dueAt:at};
+  }
+  async viewer(p: Principal, input: unknown) {
+    return queryViewer(this.store, p, viewerQuerySchema.parse(input), this.config.viewerCatalog ?? 'disabled', async conversationId => (await this.conversation(p, conversationId)).value, this.now);
   }
   async history(p:Principal,conversationId:string,limit=30,cursor?:string) {
     if(!p.scopes.includes('history:read')) requireScope(p,'messages:read'); await this.conversation(p,conversationId);

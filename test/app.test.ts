@@ -405,8 +405,7 @@ test('human history identity sees permitted conversations only and cannot discov
   assert.equal(otherHistory.status, 404);
   const viewer = await app.fetch(new Request('https://bridge.example.test/viewer'));
   const viewerHtml = await viewer.text();
-  assert.match(viewerHtml, /type="password"/);
-  assert.match(viewerHtml, /Authorization:'Bearer '\+currentToken/);
+  assert.match(viewerHtml, /const oauth=null/);
   assert.doesNotMatch(viewerHtml, /localStorage|document.cookie/);
   assert.doesNotMatch(viewerHtml, /Synthetic request|Unrelated synthetic conversation/);
   const anonymousHistory = await app.fetch(new Request('https://bridge.example.test/history?conversationId=conversation_1'));
@@ -416,40 +415,22 @@ test('human history identity sees permitted conversations only and cannot discov
 });
 
 
-test('history viewer sends its in-memory token only as a header and renders message content as text', async () => {
+test('manual viewer keeps the token only in session memory and clears it', async () => {
   const { app } = await fixture();
-  const response = await app.fetch(new Request('https://bridge.example.test/viewer'));
-  const html = await response.text();
+  const html = await (await app.fetch(new Request('https://bridge.example.test/viewer'))).text();
   const script = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
   assert.ok(script);
-  const requests: { url: string; init: { headers: { Authorization: string } } }[] = [];
-  const rendered: { textContent: string }[] = [];
-  const tokenInput = { value: 'synthetic-access-token' };
-  const form = { onsubmit: undefined as ((event: object) => void) | undefined };
-  const more = { hidden: true, onclick: undefined as (() => void) | undefined };
-  const clear = { onclick: undefined as (() => void) | undefined };
-  const main = { textContent: '', append: (node: { textContent: string }) => rendered.push(node) };
-  const elements: Record<string, unknown> = { '#token': tokenInput, form, '#more': more, '#clear': clear, '#status': { textContent: '' }, main };
-  runInNewContext(script, {
-    URLSearchParams,
-    document: { querySelector: (selector: string) => elements[selector], createElement: () => ({ textContent: '' }) },
-    fetch: async (url: string, init: { headers: { Authorization: string } }) => {
-      requests.push({ url, init });
-      return { ok: true, json: async () => ({ messages: [{ timestamp: '2026-01-01T00:00:00Z', sender: 'alpha', recipient: 'beta', text: '<script>untrusted text</script>' }] }) };
-    },
-  });
-  form.onsubmit!({ preventDefault() {}, target: { conversation: { value: 'conversation_1' } } });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0]?.url, '/history?conversationId=conversation_1');
-  assert.equal(requests[0]?.init.headers.Authorization, 'Bearer synthetic-access-token');
-  assert.match(rendered[0]?.textContent ?? '', /<script>untrusted text<\/script>/);
-  clear.onclick!();
-  assert.equal(tokenInput.value, '');
-  assert.equal(main.textContent, '');
-  assert.equal(more.hidden, true);
+  const storage = new Map<string, string>();
+  const session = runInNewContext(script + ';globalThis.bridgeSession;', { sessionStorage: { removeItem: (key: string) => storage.delete(key) } });
+  await session.ready;
+  session.setToken('synthetic-access-token');
+  assert.equal(session.getToken(), 'synthetic-access-token');
+  assert.equal(session.getSnapshot().authenticated, true);
+  assert.equal(storage.size, 0);
+  session.clear();
+  assert.equal(session.getToken(), '');
+  assert.equal(session.getSnapshot().authenticated, false);
 });
-
 
 test('MCP maps the same JWT subject to separate client principals with exact external scope aliases', async () => {
   const f = await fixture();
@@ -523,17 +504,9 @@ async function browser(html: string, options: BrowserOptions = {}) {
   const navigations: string[] = [];
   const replacements: string[] = [];
   const requests: { url: string; init: Record<string, any> }[] = [];
-  const rendered: { textContent: string }[] = [];
-  const status = { textContent: '' };
-  const form = { onsubmit: undefined as ((event: object) => Promise<void>) | undefined };
-  const login = { disabled: false, onclick: undefined as (() => Promise<void>) | undefined };
-  const clear = { onclick: undefined as (() => void) | undefined };
-  const more = { hidden: true, onclick: undefined as (() => Promise<void>) | undefined };
-  const main = { textContent: '', append: (node: { textContent: string }) => rendered.push(node) };
-  const elements: Record<string, unknown> = { form, '#login': login, '#clear': clear, '#more': more, '#status': status, main };
   let at = options.at ?? Date.now();
   const location = { href: options.url ?? viewerOAuth.redirectUri, assign: (url: string) => navigations.push(url) };
-  const ready = runInNewContext(script + ';oauthReady;', {
+  const session = runInNewContext(script + ';globalThis.bridgeSession;', {
     URL, URLSearchParams, TextEncoder, Uint8Array, crypto: webcrypto, AbortSignal,
     btoa: (input: string) => Buffer.from(input, 'binary').toString('base64'),
     Date: class extends Date { static override now() { return at; } },
@@ -544,16 +517,15 @@ async function browser(html: string, options: BrowserOptions = {}) {
       setItem: (key: string, value: string) => { writes.push(value); storage.set(key, value); },
       removeItem: (key: string) => storage.delete(key),
     },
-    document: { querySelector: (selector: string) => elements[selector], createElement: () => ({ textContent: '' }) },
     fetch: async (url: string, init: Record<string, any>) => {
       requests.push({ url, init });
       assert.ok(replacements.length > 0, 'callback URL must be scrubbed before any exchange or authenticated read');
       assert.equal(storage.has(pkceStorageKey), false, 'PKCE verifier must be consumed before exchange');
       return options.fetch ? options.fetch(url, init) : { ok: true, status: 200, json: async () => ({ access_token: 'ephemeral-access-token', refresh_token: 'discard-refresh-token', id_token: 'discard-id-token', token_type: 'Bearer', expires_in: 60 }) };
     },
-  }) as Promise<void>;
-  await ready;
-  return { storage, writes, navigations, replacements, requests, rendered, status, login, clear, more, main, advance: (ms: number) => { at += ms; }, submit: () => form.onsubmit!({ preventDefault() {}, target: { conversation: { value: 'conversation_1' } } }) };
+  });
+  await session.ready;
+  return { storage, writes, navigations, replacements, requests, status: { get textContent() { return session.getSnapshot().message; } }, login: { onclick: session.startLogin }, clear: { onclick: session.clear }, advance: (ms: number) => { at += ms; }, getToken: session.getToken, suspend: session.suspend };
 }
 function pendingTransaction(at = Date.now(), issuerRequired = viewerOAuth.authorizationResponseIssuerRequired) {
   return { verifier: 'V'.repeat(43), state: 'S'.repeat(43), createdAt: at, clientId: viewerOAuth.clientId, redirectUri: viewerOAuth.redirectUri, resource, tokenUrl: viewerOAuth.tokenUrl, issuer, issuerRequired };
@@ -575,6 +547,8 @@ test('optional OAuth viewer uses real WebCrypto S256 and completes public-client
   assert.notEqual(pending.verifier, pending.state);
   assert.equal(pending.issuer, issuer);
   assert.equal(pending.issuerRequired, viewerOAuth.authorizationResponseIssuerRequired);
+  first.suspend();
+  assert.equal(first.storage.has(pkceStorageKey), true, 'pagehide during OAuth navigation must retain the pending PKCE transaction');
   assert.equal(authorization.searchParams.get('code_challenge'), createHash('sha256').update(pending.verifier).digest('base64url'));
   for (const [key, value] of Object.entries({ response_type: 'code', client_id: viewerOAuth.clientId, redirect_uri: viewerOAuth.redirectUri, resource, scope: 'bridge/history:read', code_challenge_method: 'S256', state: pending.state })) {
     assert.equal(authorization.searchParams.get(key), value);
@@ -588,7 +562,7 @@ test('optional OAuth viewer uses real WebCrypto S256 and completes public-client
   });
   assert.deepEqual(callback.replacements, [viewerOAuth.redirectUri]);
   assert.equal(callback.storage.size, 0);
-  assert.match(callback.status.textContent, /Signed in/);
+  assert.match(callback.status.textContent, /Login concluído/);
   const exchange = callback.requests[0]!;
   assert.equal(exchange.url, viewerOAuth.tokenUrl);
   assert.equal(exchange.init.method, 'POST');
@@ -603,15 +577,12 @@ test('optional OAuth viewer uses real WebCrypto S256 and completes public-client
   assert.equal(form.get('resource'), authorization.searchParams.get('resource'));
   assert.equal(form.has('client_secret'), false);
   assert.equal(exchange.init.headers.Authorization, undefined);
-  await callback.submit();
-  assert.equal(callback.requests[1]?.url, '/history?conversationId=conversation_1');
-  assert.equal(callback.requests[1]?.init.headers.Authorization, 'Bearer ephemeral-access-token');
-  assert.match(callback.rendered[0]?.textContent ?? '', /Visible history/);
+  assert.equal(callback.getToken(), 'ephemeral-access-token');
   assert.equal(callback.writes.length, 0);
   assert.doesNotMatch(first.writes.join(''), /access_token|refresh_token|id_token|synthetic-code/);
   callback.advance(60_001);
-  await callback.submit();
-  assert.equal(callback.requests.length, 2, 'expired tokens must not be sent');
+  assert.equal(callback.getToken(), '', 'expired tokens must not be sent');
+  assert.equal(callback.requests.length, 1);
   callback.clear.onclick!();
   assert.equal(callback.storage.size, 0);
 });
@@ -639,7 +610,7 @@ test('OAuth callback rejects wrong/missing/expired/replayed state and issuer bef
     assert.equal(page.requests.length, 0, scenario.query);
     assert.equal(page.storage.size, 0);
     assert.deepEqual(page.replacements, [viewerOAuth.redirectUri]);
-    assert.match(page.status.textContent, /Sign-in failed or expired/);
+    assert.match(page.status.textContent, /Login inválido ou expirado/);
   }
 });
 
@@ -658,7 +629,7 @@ test('OAuth viewer enforces the configured issuer policy before exchanging a cod
       const storage = new Map([[pkceStorageKey, JSON.stringify(pendingTransaction(at, required))]]);
       const page = await browser(html, { url: viewerOAuth.redirectUri + '?code=test&state=' + 'S'.repeat(43) + scenario.suffix, storage, at });
       assert.equal(page.requests.length, scenario.succeeds ? 1 : 0, JSON.stringify({ required, ...scenario }));
-      assert.match(page.status.textContent, scenario.succeeds ? /Signed in/ : /Sign-in failed or expired/);
+      assert.match(page.status.textContent, scenario.succeeds ? /Login concluído/ : /Login inválido ou expirado/);
       assert.equal(page.storage.size, 0);
     }
     const changedPolicy = new Map([[pkceStorageKey, JSON.stringify(pendingTransaction(at, !required))]]);
@@ -680,7 +651,7 @@ test('OAuth token exchange uses the authorized resource even when callback query
     },
   });
   assert.equal(page.requests.length, 1);
-  assert.match(page.status.textContent, /Signed in/);
+  assert.match(page.status.textContent, /Login concluído/);
   assert.deepEqual(new URLSearchParams(page.requests[0]!.init.body).getAll('resource'), [resource]);
 });
 
@@ -700,7 +671,7 @@ test('OAuth exchange failures discard PKCE state and do not retain a token or ex
     assert.equal(page.storage.size, 0);
     assert.equal(page.writes.length, 0);
     assert.doesNotMatch(page.status.textContent, /SYNTHETIC_PRIVATE_ERROR/);
-    await page.submit();
+    assert.equal(page.getToken(), '');
     assert.equal(page.requests.length, 1, 'failed exchange must not authorize history requests');
   }
 });
@@ -710,6 +681,25 @@ test('OAuth viewer rejects resource/audience mismatch and escapes public configu
   await assert.rejects(oauthPage({}, 'different-audience'), /Invalid viewer OAuth configuration/);
   await assert.rejects(oauthPage({ redirectUri: 'https://other.example.test/viewer' }), /Invalid viewer OAuth configuration/);
   const html = await (await oauthPage({ clientId: '</script><script>bad</script>' })).text();
-  assert.equal((html.match(/<script>/g) ?? []).length, 1);
-  assert.equal((html.match(/<\/script>/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /<script>bad<\/script>/);
+  assert.match(html, /clientId.*\\u003c/);
+  assert.equal((html.match(/<\/script>/g) ?? []).length, 2);
+});
+
+test('viewer POST keeps queries out of URLs and enforces origin, auth, scope and conversation ACL', async () => {
+  const { app, bridge } = await fixture();
+  await bridge.send(alpha, message());
+  const body = JSON.stringify({ operation: 'messages', conversationId: 'conversation_1', term: 'Synthetic' });
+  const request = (headers: Record<string, string>, content = body) => app.fetch(new Request('https://bridge.example.test/history', { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: content }));
+  const auth = { authorization: `Bearer ${await token('reader')}` };
+  const response = await request({ ...auth, origin: 'https://bridge.example.test' });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).messages.length, 1);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal((await request({ ...auth, origin: 'https://untrusted.example.test' })).status, 403);
+  assert.equal((await request({})).status, 401);
+  assert.equal((await request({ authorization: `Bearer ${await token('alpha', 'messages:read')}` })).status, 403);
+  assert.equal((await request(auth, JSON.stringify({ operation: 'messages', conversationId: 'private_other' }))).status, 404);
+  assert.equal((await request(auth, JSON.stringify({ operation: 'messages', conversationId: 'conversation_1', text: 'no mutation' }))).status, 400);
+  assert.equal((await request(auth, 'x'.repeat(65537))).status, 413);
 });

@@ -55,6 +55,10 @@ package:
   individually: true
   patterns:
     - '!test/**'
+    - '!viewer/**'
+    - '!vite.config.ts'
+    - '!playwright.config.ts'
+    - '!components.json'
     - '!docs/**'
     - '!scripts/**'
     - '!examples/**'
@@ -101,6 +105,9 @@ functions:
       - http:
           path: history
           method: get
+      - http:
+          path: history
+          method: post
       - http:
           path: viewer
           method: get
@@ -275,6 +282,7 @@ resources:
                   - ${param:installationId}#subscriptions#*
                   - ${param:installationId}#subscription-secrets#*
                   - ${param:installationId}#inbox#*
+                  - ${param:installationId}#catalog#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
             - Effect: Allow
@@ -307,6 +315,7 @@ resources:
                   - ${param:installationId}#rate#*
                   - ${param:installationId}#outbox#*
                   - ${param:installationId}#inbox#*
+                  - ${param:installationId}#catalog#*
                   - ${param:installationId}#subscriptions#*
                   - ${param:installationId}#subscription-secrets#*
                 'Null':
@@ -363,6 +372,7 @@ resources:
                   - ${param:installationId}#rate#*
                   - ${param:installationId}#subscriptions#*
                   - ${param:installationId}#inbox#*
+                  - ${param:installationId}#catalog#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
             - Effect: Allow
@@ -395,6 +405,7 @@ resources:
                   - ${param:installationId}#rate#*
                   - ${param:installationId}#outbox#*
                   - ${param:installationId}#inbox#*
+                  - ${param:installationId}#catalog#*
                   - ${param:installationId}#callback#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
@@ -455,6 +466,7 @@ resources:
                 ForAllValues:StringLike:
                   dynamodb:LeadingKeys:
                   - ${param:installationId}#history#*
+                  - ${param:installationId}#catalog#*
                 'Null':
                   dynamodb:LeadingKeys: 'false'
     StreamRole:
