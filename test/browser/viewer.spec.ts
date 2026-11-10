@@ -166,3 +166,38 @@ test('erro recuperável e expiração removem o conteúdo privado', async ({
   await expect(page.getByLabel('Token de acesso')).toBeVisible();
   await expect(page.getByRole('article')).toHaveCount(0);
 });
+
+test('modo escuro acompanha o sistema e alterna por teclado sem perder a conversa', async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await login(page);
+  await expect(page.locator('html')).toHaveClass('dark');
+  await select(page, isMobile);
+  await expect(page.getByRole('article')).toHaveCount(30);
+  await page.getByRole('button', { name: 'Atualizar histórico' }).waitFor();
+  await expect(
+    page.getByRole('button', { name: 'Atualizar histórico' }),
+  ).toBeEnabled();
+  await page.screenshot({ path: testInfo.outputPath('viewer-dark.png') });
+  await page.getByRole('button', { name: 'Ativar modo claro' }).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('html')).not.toHaveClass('dark');
+  await expect(page.getByRole('article')).toHaveCount(30);
+  await page.getByRole('button', { name: 'Ativar modo escuro' }).click();
+  await expect(page.locator('html')).toHaveClass('dark');
+  await page.getByRole('button', { name: 'Abrir por ID' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  expect(
+    await page
+      .getByRole('dialog')
+      .evaluate((el) => getComputedStyle(el).backgroundColor),
+  ).toBe('rgb(32, 32, 32)');
+  await page.keyboard.press('Escape');
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});

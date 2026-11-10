@@ -4,6 +4,8 @@ A revisão visual da issue #4 foi aprovada antes da implementação. O viewer us
 
 ## Uso e limites
 
+O tema inicial acompanha a preferência do sistema. O botão no cabeçalho alterna entre modo claro e escuro, inclusive na tela de login. A escolha permanece apenas durante a página aberta.
+
 - Lista por participante e ID, com busca por ID/participante; abertura por ID disponível em desktop/celular.
 - Busca literal sem distinção de maiúsculas no texto da conversa selecionada, com período de 24 horas, 7 ou 14 dias. Não é busca global nem índice full-text.
 - Cada chamada examina 30 registros por padrão, no máximo 100. Uma página vazia ainda pode ter continuação. O fim só é indicado quando não há cursor. A lista percorre uma partição de participante por chamada; o custo adicional de autorização é limitado aos candidatos dessa página.

@@ -6,6 +6,8 @@ import React, {
 } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
+  Sun,
+  Moon,
   Search,
   RefreshCw,
   LogOut,
@@ -707,6 +709,12 @@ function Workspace({ now }: { now: number }) {
 }
 function App() {
   const auth = useSyncExternalStore(session.subscribe, session.getSnapshot);
+  const [dark, setDark] = useState(
+    () => matchMedia('(prefers-color-scheme: dark)').matches,
+  );
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', dark);
+  }, [dark]);
   const [manual, setManual] = useState(''),
     [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -732,18 +740,32 @@ function App() {
           <span className="font-semibold">Agent Message Bridge</span>
           <Badge variant="secondary">Somente leitura</Badge>
         </div>
-        {auth.authenticated && (
+        <div className="flex items-center gap-2">
           <Button
             variant="ghost"
-            onClick={() => {
-              session.clear();
-              setManual('');
-            }}
+            onClick={() => setDark((value) => !value)}
+            aria-label={dark ? 'Ativar modo claro' : 'Ativar modo escuro'}
           >
-            <LogOut data-icon="inline-start" />
-            Sair e limpar
+            {dark ? (
+              <Sun data-icon="inline-start" />
+            ) : (
+              <Moon data-icon="inline-start" />
+            )}
+            {dark ? 'Modo claro' : 'Modo escuro'}
           </Button>
-        )}
+          {auth.authenticated && (
+            <Button
+              variant="ghost"
+              onClick={() => {
+                session.clear();
+                setManual('');
+              }}
+            >
+              <LogOut data-icon="inline-start" />
+              Sair e limpar
+            </Button>
+          )}
+        </div>
       </header>
       <p role="status" className="px-5 py-2 text-sm text-muted-foreground">
         {auth.message}
