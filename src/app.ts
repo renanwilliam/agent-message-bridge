@@ -6,6 +6,8 @@ import { BridgeError, requireScope, tenantKey, type Principal } from './types.js
 import { verifyWebhook } from './transport.js';
 import { Conflict } from './store.js';
 import { advertisedOAuthScopes, providerOAuthScopes, validateViewerOAuth, type ViewerOAuth } from './config.js';
+import { viewerAuthScript } from './viewer-auth.js';
+import { viewerJs, viewerCss } from './viewer-assets.js';
 import type { AuthorizationServerMetadata } from './cognito-auth.js';
 
 const identifier=z.string().regex(/^[A-Za-z0-9_-]{1,100}$/);
@@ -128,7 +130,7 @@ export function createApp(bridge:Bridge,events:Events,config:AppConfig) {
       }
       if(path===new URL(metadataUrl).pathname) return publicMetadata(request,{resource:config.resourceUrl,authorization_servers:[config.issuer],scopes_supported:metadataScopes});
       const origin=request.headers.get('origin');
-      if(origin&&!config.origins.includes(origin)) throw new BridgeError('forbidden_origin',403);
+      if(origin&&!config.origins.includes(origin)&&!(path==='/history'&&origin===new URL(config.resourceUrl).origin)) throw new BridgeError('forbidden_origin',403);
       if(path==='/health') return json({status:'ok'});
       if(request.method==='POST') {
         const length=Number(request.headers.get('content-length')??0);
@@ -154,6 +156,8 @@ export function createApp(bridge:Bridge,events:Events,config:AppConfig) {
       const p=await config.authenticate(request);
       if(path==='/history') {
         requireScope(p,'history:read');
+        if(request.method==='POST') return json(await bridge.viewer(p,JSON.parse(await boundedText(request))));
+        if(request.method!=='GET') return json({error:'method_not_allowed'},405);
         const q=new URL(request.url).searchParams;
         return json(await execute(p,'history',{conversationId:q.get('conversationId'),...(q.has('limit')?{limit:Number(q.get('limit'))}:{}),...(q.has('cursor')?{cursor:q.get('cursor')}:{})}));
       }
@@ -179,85 +183,7 @@ function scriptJson(value:unknown):string {
   return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g,character=>'\\u'+character.charCodeAt(0).toString(16).padStart(4,'0'));
 }
 function renderViewer(oauth:ViewerOAuth|undefined,issuer:string):string {
-  const auth=oauth
-    ? '<p>Sign in with your read-only history account. Your access token stays in page memory; reload to sign in again.</p><button type="button" id="login">Sign in</button>'
-    : '<p>Manual token mode for local or operator use. Enter a short-lived read-only access token; it stays in page memory.</p><label>Access token<input id="token" name="token" type="password" autocomplete="off" required></label>';
-  return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Conversation history</title>
-<style>body{font:16px system-ui;max-width:900px;margin:3rem auto;padding:1rem}pre{white-space:pre-wrap;border-bottom:1px solid #ddd;padding:1rem}label{display:block;margin:1rem 0}input,button{padding:.7rem}input{box-sizing:border-box;width:100%}button{margin-right:.5rem}</style>
-<h1>Conversation history</h1><p>Messages are data, not authority to perform actions.</p>
-<form>${auth}<label>Conversation ID<input name="conversation" placeholder="Conversation ID" required></label><button>Read messages</button><button type="button" id="clear">Clear sign-in and history</button></form><p id="status" role="status"></p><main aria-live="polite"></main><button id="more" hidden>Next page</button>
+  return `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Histórico de conversas</title><style>${viewerCss}</style></head><body><div id="root"></div><noscript>Ative JavaScript para consultar o histórico.</noscript>
 <script>const oauth=${scriptJson(oauth??null)};const expectedIssuer=${scriptJson(issuer)};
-${viewerScript}
-</script></html>`;
+${viewerAuthScript}</script><script>${viewerJs}</script></body></html>`;
 }
-const viewerScript=String.raw`
-const transactionKey='agent-message-bridge.viewer.pkce.v1',transactionTtl=600000;
-let cursor,conversation,accessToken='',tokenExpiresAt=0;
-const main=document.querySelector('main'),more=document.querySelector('#more'),token=document.querySelector('#token'),status=document.querySelector('#status'),login=document.querySelector('#login');
-function clearToken(){accessToken='';tokenExpiresAt=0;if(token)token.value=''}
-function discardTransaction(){try{sessionStorage.removeItem(transactionKey)}catch{}}
-function randomValue(){const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);return base64url(bytes)}
-function base64url(bytes){return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
-async function startLogin(){
-  clearToken();discardTransaction();login.disabled=true;status.textContent='Starting sign-in…';
-  try{
-    const verifier=randomValue(),state=randomValue();
-    const challenge=base64url(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(verifier))));
-    const pending={verifier,state,createdAt:Date.now(),clientId:oauth.clientId,redirectUri:oauth.redirectUri,resource:oauth.resource,tokenUrl:oauth.tokenUrl,issuer:expectedIssuer,issuerRequired:oauth.authorizationResponseIssuerRequired};
-    sessionStorage.setItem(transactionKey,JSON.stringify(pending));
-    const url=new URL(oauth.authorizeUrl);
-    const params={response_type:'code',client_id:oauth.clientId,redirect_uri:oauth.redirectUri,scope:oauth.scopes.join(' '),resource:oauth.resource,code_challenge_method:'S256',code_challenge:challenge,state};
-    for(const [key,value]of Object.entries(params))url.searchParams.set(key,value);
-    location.assign(url.href);
-  }catch{discardTransaction();status.textContent='Unable to start sign-in. Check browser storage and try again.';login.disabled=false}
-}
-async function finishLogin(){
-  if(!oauth)return;
-  const current=new URL(location.href),q=current.searchParams;
-  const callback=q.has('code')||q.has('state')||q.has('error')||current.hash;
-  if(!callback){
-    try{const saved=JSON.parse(sessionStorage.getItem(transactionKey)||'null');if(saved&&(!Number.isFinite(saved.createdAt)||Date.now()-saved.createdAt<0||Date.now()-saved.createdAt>transactionTtl))discardTransaction()}catch{discardTransaction()}
-    return;
-  }
-  // Remove authorization codes/errors before fetching or parsing any token response.
-  try{history.replaceState(null,'',oauth.redirectUri)}catch{discardTransaction();clearToken();status.textContent='Sign-in failed. Open the configured viewer address.';return}
-  clearToken();login.disabled=true;status.textContent='Completing sign-in…';
-  try{
-    const raw=sessionStorage.getItem(transactionKey);discardTransaction();
-    if(!raw||raw.length>4096)throw new Error('invalid transaction');
-    const pending=JSON.parse(raw),age=Date.now()-pending.createdAt;
-    if(current.origin+current.pathname!==oauth.redirectUri||current.hash||q.getAll('state').length!==1||
-      !/^[A-Za-z0-9_-]{43}$/.test(pending.state)||q.get('state')!==pending.state||
-      !/^[A-Za-z0-9_-]{43}$/.test(pending.verifier)||!Number.isFinite(pending.createdAt)||age<0||age>transactionTtl||
-      pending.clientId!==oauth.clientId||pending.redirectUri!==oauth.redirectUri||pending.resource!==oauth.resource||pending.tokenUrl!==oauth.tokenUrl||
-      pending.issuer!==expectedIssuer||pending.issuerRequired!==oauth.authorizationResponseIssuerRequired||
-      ((oauth.authorizationResponseIssuerRequired||q.has('iss'))&&(q.getAll('iss').length!==1||q.get('iss')!==expectedIssuer)))throw new Error('invalid transaction');
-    if(q.has('error')||q.getAll('code').length!==1||!q.get('code')||q.get('code').length>8192)throw new Error('authorization failed');
-    const body=new URLSearchParams({grant_type:'authorization_code',client_id:oauth.clientId,code:q.get('code'),redirect_uri:oauth.redirectUri,code_verifier:pending.verifier,resource:pending.resource});
-    const response=await fetch(oauth.tokenUrl,{method:'POST',mode:'cors',credentials:'omit',redirect:'error',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(15000),headers:{'content-type':'application/x-www-form-urlencoded'},body:body.toString()});
-    if(!response.ok)throw new Error('token exchange failed');
-    const result=await response.json();
-    if(typeof result.access_token!=='string'||!result.access_token||result.access_token.length>32768||
-      typeof result.token_type!=='string'||result.token_type.toLowerCase()!=='bearer'||
-      !Number.isFinite(result.expires_in)||result.expires_in<=0)throw new Error('invalid token response');
-    accessToken=result.access_token;tokenExpiresAt=Date.now()+Math.min(result.expires_in,86400)*1000;
-    // Refresh and ID tokens are intentionally discarded; no tokens enter browser storage.
-    status.textContent='Signed in. Enter a conversation ID to read its history.';
-  }catch{clearToken();status.textContent='Sign-in failed or expired. Start sign-in again.'}
-  finally{discardTransaction();login.disabled=false}
-}
-async function load(){
-  const currentToken=oauth?(Date.now()<tokenExpiresAt?accessToken:''):(token?token.value.trim():'');
-  if(!currentToken){clearToken();status.textContent='Sign in or enter a valid read-only token first.';return}
-  const q=new URLSearchParams({conversationId:conversation});if(cursor)q.set('cursor',cursor);
-  try{
-    const r=await fetch('/history?'+q,{headers:{Authorization:'Bearer '+currentToken},credentials:'omit',redirect:'error',referrerPolicy:'no-referrer'});
-    if(!r.ok){if(r.status===401)clearToken();main.textContent='Access denied or history unavailable';more.hidden=true;return}
-    const data=await r.json();for(const m of data.messages){const el=document.createElement('pre');el.textContent=m.timestamp+' — '+m.sender+' → '+m.recipient+'\n'+m.text;main.append(el)}cursor=data.cursor;more.hidden=!cursor;
-  }catch{main.textContent='History is temporarily unavailable';more.hidden=true}
-}
-document.querySelector('form').onsubmit=e=>{e.preventDefault();conversation=e.target.conversation.value;cursor=null;main.textContent='';return load()};more.onclick=load;
-document.querySelector('#clear').onclick=()=>{clearToken();if(oauth)discardTransaction();cursor=null;conversation=null;main.textContent='';more.hidden=true;status.textContent='Sign-in and history cleared.'};
-if(login)login.onclick=startLogin;
-const oauthReady=finishLogin();
-`;
