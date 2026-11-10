@@ -230,3 +230,24 @@ test('publicações concorrentes mantêm um único índice por conversa e partic
     assert.deepEqual(rows.items[0]?.value, metadata?.value.latest);
   }
 });
+
+test('período compara instantes com precisões diferentes e inclui os limites', async () => {
+  const f = fixture();
+  await f.send('m1');
+  f.advance(100);
+  await f.send('m2');
+  const query = { operation: 'messages', conversationId: 'demo' };
+  for (const period of [
+    { since: '2026-11-10T00:00:00Z', until: '2026-11-10T00:00:00.000Z' },
+    { since: '2026-11-10T00:00:00.000Z', until: '2026-11-10T00:00:00Z' },
+  ]) {
+    const page = await f.bridge.viewer(reader, { ...query, ...period });
+    assert.ok('messages' in page);
+    assert.deepEqual(page.messages.map((m) => m.id), ['m1']);
+  }
+  await assert.rejects(f.bridge.viewer(reader, {
+    ...query,
+    since: '2026-11-10T00:00:00.1Z',
+    until: '2026-11-10T00:00:00Z',
+  }));
+});

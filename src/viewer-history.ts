@@ -28,7 +28,7 @@ export const viewerQuerySchema = z.discriminatedUnion('operation', [
       until: z.string().datetime().optional(),
     })
     .strict()
-    .refine((v) => !v.since || !v.until || v.since <= v.until, {
+    .refine((v) => !v.since || !v.until || Date.parse(v.since) <= Date.parse(v.until), {
       message: 'Invalid period',
     }),
 ]);
@@ -122,8 +122,8 @@ export async function queryViewer(
       .filter(
         ({ value: m }) =>
           !messageExpired(m, now()) &&
-          (!query.since || m.timestamp >= query.since) &&
-          (!query.until || m.timestamp <= query.until) &&
+          (!query.since || Date.parse(m.timestamp) >= Date.parse(query.since)) &&
+          (!query.until || Date.parse(m.timestamp) <= Date.parse(query.until)) &&
           m.text.toLocaleLowerCase('pt-BR').includes(term),
       )
       .map((row) => row.value);
