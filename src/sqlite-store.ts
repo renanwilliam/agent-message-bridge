@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { Conflict, type DueKey, type Key, type Page, type Row, type Store, type Write } from './store.js';
+import { Conflict, type DueKey, type Key, type Page, type QueryOrder, type Row, type Store, type Write } from './store.js';
 import { cursorFor, readCursor, validateDue, validateKey, validateLimit, validateQuery, validateWrites } from './store-utils.js';
 
 type SqlRow = { pk: string; sk: string; version: number; value_json: string; due_at: number | null; retention_expires_at: number | null };
@@ -47,18 +47,18 @@ export class SqliteStore implements Store {
     const row = this.db.prepare('SELECT * FROM records WHERE pk = ? AND sk = ?').get(key.pk, key.sk) as SqlRow | undefined;
     return row ? rowFromSql<T>(row) : undefined;
   }
-  async query<T = Record<string, unknown>>(pk: string, prefix: string, limit: number, cursor?: string): Promise<Page<T>> {
-    validateQuery(pk, prefix, limit);
-    const after = readCursor(cursor, pk, prefix);
+  async query<T = Record<string, unknown>>(pk: string, prefix: string, limit: number, cursor?: string, order: QueryOrder = 'asc'): Promise<Page<T>> {
+    validateQuery(pk, prefix, limit, order);
+    const after = readCursor(cursor, pk, prefix, order);
     const upper = upperPrefix(prefix);
     const clauses = ['pk = ?', 'sk >= ?'];
     const args: (string | number)[] = [pk, prefix];
     if (upper !== undefined) { clauses.push('sk < ?'); args.push(upper); }
-    if (after !== undefined) { clauses.push('sk > ?'); args.push(after); }
+    if (after !== undefined) { clauses.push(order === 'asc' ? 'sk > ?' : 'sk < ?'); args.push(after); }
     args.push(limit + 1);
-    const rows = this.db.prepare(`SELECT * FROM records WHERE ${clauses.join(' AND ')} ORDER BY sk LIMIT ?`).all(...args) as SqlRow[];
+    const rows = this.db.prepare(`SELECT * FROM records WHERE ${clauses.join(' AND ')} ORDER BY sk ${order === 'asc' ? 'ASC' : 'DESC'} LIMIT ?`).all(...args) as SqlRow[];
     const items = rows.slice(0, limit).map(row => rowFromSql<T>(row));
-    return { items, ...(rows.length > limit ? { cursor: cursorFor(pk, prefix, items.at(-1)!.sk) } : {}) };
+    return { items, ...(rows.length > limit ? { cursor: cursorFor(pk, prefix, items.at(-1)!.sk, order) } : {}) };
   }
   async due(now: number, limit: number): Promise<DueKey[]> {
     validateDue(now); validateLimit(limit);
