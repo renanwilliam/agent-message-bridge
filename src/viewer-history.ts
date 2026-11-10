@@ -24,6 +24,7 @@ export const viewerQuerySchema = z.discriminatedUnion('operation', [
       operation: z.literal('messages'),
       ...common,
       conversationId: identifier,
+      order: z.enum(['asc', 'desc']).default('asc'),
       since: z.string().datetime().optional(),
       until: z.string().datetime().optional(),
     })
@@ -57,6 +58,9 @@ const positionSchema = z
 // O cursor delimita uma posição, nunca concede acesso. A ACL é relida em toda chamada.
 function position(p: Principal, query: Query) {
   const { cursor, ...filters } = query;
+  // Preserve existing ascending REST cursors; only reverse traversal adds a binding field.
+  const bindingFilters: Record<string, unknown> = { ...filters };
+  if (bindingFilters.order === 'asc') delete bindingFilters.order;
   const binding = createHash('sha256')
     .update(
       JSON.stringify([
@@ -64,7 +68,7 @@ function position(p: Principal, query: Query) {
         p.id,
         [...p.scopes].sort(),
         [...(p.readParticipants ?? [])].sort(),
-        filters,
+        bindingFilters,
       ]),
     )
     .digest('hex');
@@ -108,7 +112,7 @@ export async function queryViewer(
     const pk = tenantKey(p.tenant, 'history', query.conversationId);
     let page;
     try {
-      page = await store.query<Message>(pk, 'message#', query.limit, pos.after);
+      page = await store.query<Message>(pk, 'message#', query.limit, pos.after, query.order);
     } catch (error) {
       if (
         error instanceof Error &&
@@ -128,7 +132,7 @@ export async function queryViewer(
       )
       .map((row) => row.value);
     const last = page.items.at(-1);
-    const after = last ? cursorFor(pk, 'message#', last.sk) : pos.after;
+    const after = last ? cursorFor(pk, 'message#', last.sk, query.order) : pos.after;
     return {
       messages,
       ...(page.cursor ? { cursor: pos.encode(0, page.cursor) } : {}),

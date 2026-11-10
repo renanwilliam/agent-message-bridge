@@ -28,35 +28,39 @@ test('descoberta, paginação, busca, conteúdo seguro e limpeza da sessão', as
   await login(page);
   await select(page, isMobile);
   await expect(page.getByRole('article')).toHaveCount(30);
+  await expect(page.getByText('Mais recentes primeiro', { exact: false })).toBeVisible();
+  await expect(page.getByRole('article').first()).toContainText('Mensagem sintética 35.');
+  await expect(page.getByRole('article').last()).toContainText('Mensagem sintética 6.');
   await page.screenshot({ path: testInfo.outputPath('viewer.png') });
+  await page.getByRole('button', { name: 'Carregar mensagens anteriores' }).click();
+  await expect(page.getByRole('article')).toHaveCount(35);
   await expect(
     page.getByText('<script>window.syntheticXss = true</script>', {
       exact: false,
     }),
   ).toBeVisible();
   expect(await page.evaluate(() => 'syntheticXss' in window)).toBe(false);
-  await page.getByRole('button', { name: 'Carregar mais mensagens' }).click();
-  await expect(page.getByRole('article')).toHaveCount(35);
   await expect(
     page.getByText('Fim do histórico disponível', { exact: true }),
   ).toBeVisible();
   await page.getByRole('article').nth(10).scrollIntoViewIfNeeded();
-  const before = await page.evaluate(() => scrollY);
   await page.getByRole('button', { name: 'Atualizar histórico' }).click();
-  await expect(page.getByRole('article')).toHaveCount(35);
-  // A atualização não força o leitor ao fim da conversa.
-  expect(Math.abs((await page.evaluate(() => scrollY)) - before)).toBeLessThan(
-    5,
-  );
+  await expect(page.getByRole('article')).toHaveCount(30);
+  await expect(page.getByRole('article').first()).toContainText('Mensagem sintética 35.');
+  await expect(page.getByRole('article').last()).toContainText('Mensagem sintética 6.');
+  const messageReads = reads.map(r => JSON.parse(r.body)).filter(r => r.operation === 'messages');
+  expect(messageReads.every(r => r.order === 'desc')).toBe(true);
+  expect(messageReads[1].cursor).toBeTruthy();
+  expect(messageReads[2].cursor).toBeUndefined();
   await page.getByLabel('Buscar nesta conversa').fill('Resultado final');
   await page
     .getByRole('button', { name: 'Buscar mensagens', exact: true })
     .click();
-  await expect(page.getByRole('article')).toHaveCount(0);
+  await expect(page.getByRole('article')).toHaveCount(1);
   await expect(
-    page.getByRole('button', { name: 'Carregar mais mensagens' }),
+    page.getByRole('button', { name: 'Carregar mensagens anteriores' }),
   ).toBeVisible();
-  await page.getByRole('button', { name: 'Carregar mais mensagens' }).click();
+  await page.getByRole('button', { name: 'Carregar mensagens anteriores' }).click();
   await expect(page.getByRole('article')).toHaveCount(1);
   expect(
     reads.every(
@@ -139,7 +143,7 @@ test('resposta atrasada não mistura conversas e chamadas repetidas não duplica
   await select(page, isMobile);
   await expect(page.getByRole('article')).toHaveCount(30);
   await page
-    .getByRole('button', { name: 'Carregar mais mensagens' })
+    .getByRole('button', { name: 'Carregar mensagens anteriores' })
     .dblclick();
   await expect(page.getByRole('article')).toHaveCount(35);
 });
@@ -158,13 +162,45 @@ test('erro recuperável e expiração removem o conteúdo privado', async ({
   await expect(page.getByRole('article')).toHaveCount(30);
   await page.unroute('**/history');
   await page.getByRole('button', { name: 'Tentar novamente' }).click();
-  await expect(page.getByRole('article')).toHaveCount(35);
+  await expect(page.getByRole('article')).toHaveCount(30);
   await page.route('**/history', (route) =>
     route.fulfill({ status: 401, body: '{}' }),
   );
   await page.getByRole('button', { name: 'Atualizar histórico' }).click();
   await expect(page.getByLabel('Token de acesso')).toBeVisible();
   await expect(page.getByRole('article')).toHaveCount(0);
+});
+test('falha ao carregar anteriores repete a mesma página e atualizar mantém os filtros', async ({ page, isMobile }) => {
+  const reads: Record<string, any>[] = [];
+  let fail = true;
+  await page.route('**/history', async route => {
+    const body = route.request().postDataJSON();
+    if (body.operation === 'messages') {
+      reads.push(body);
+      if (body.cursor && fail) {
+        fail = false;
+        await route.fulfill({ status: 503, body: '{}' });
+        return;
+      }
+    }
+    await route.continue();
+  });
+  await login(page);await select(page, isMobile);
+  await page.getByRole('button', { name: 'Carregar mensagens anteriores' }).click();
+  await expect(page.getByText('Consulta não concluída')).toBeVisible();
+  await expect(page.getByRole('article')).toHaveCount(30);
+  await page.getByRole('button', { name: 'Tentar novamente' }).click();
+  await expect(page.getByRole('article')).toHaveCount(35);
+  expect(reads[1]!.cursor).toBe(reads[2]!.cursor);
+  await page.getByLabel('Buscar nesta conversa').fill('Resultado final');
+  await page.getByRole('button', { name: 'Buscar mensagens', exact: true }).click();
+  await expect(page.getByRole('article')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Atualizar histórico' }).click();
+  await expect(page.getByRole('button', { name: 'Atualizar histórico' })).toBeEnabled();
+  expect(reads.at(-1)).toEqual({ ...reads.at(-2), cursor: undefined });
+  expect(reads.at(-1)!.term).toBe('Resultado final');
+  expect(reads.at(-1)!.since).toBeTruthy();
+  expect(reads.at(-1)!.cursor).toBeUndefined();
 });
 
 test('modo escuro acompanha o sistema e alterna por teclado sem perder a conversa', async ({

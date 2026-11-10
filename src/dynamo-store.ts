@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
-import { Conflict, type DueKey, type Key, type Page, type Row, type Store, type Write } from './store.js';
+import { Conflict, type DueKey, type Key, type Page, type QueryOrder, type Row, type Store, type Write } from './store.js';
 import { cursorFor, nextRow, readCursor, validateDue, validateKey, validateLimit, validateQuery, validateWrites } from './store-utils.js';
 
 function decode<T>(item: Record<string, unknown>): Row<T> {
@@ -24,18 +24,18 @@ export class DynamoStore implements Store {
     const result = await this.client.send(new GetCommand({ TableName: this.tableName, Key: key, ConsistentRead: true }));
     return result.Item ? decode<T>(result.Item) : undefined;
   }
-  async query<T = Record<string, unknown>>(pk: string, prefix: string, limit: number, cursor?: string): Promise<Page<T>> {
-    validateQuery(pk, prefix, limit);
-    const after = readCursor(cursor, pk, prefix);
+  async query<T = Record<string, unknown>>(pk: string, prefix: string, limit: number, cursor?: string, order: QueryOrder = 'asc'): Promise<Page<T>> {
+    validateQuery(pk, prefix, limit, order);
+    const after = readCursor(cursor, pk, prefix, order);
     const result = await this.client.send(new QueryCommand({
-      TableName: this.tableName, ConsistentRead: true, Limit: limit, ScanIndexForward: true,
+      TableName: this.tableName, ConsistentRead: true, Limit: limit, ScanIndexForward: order === 'asc',
       KeyConditionExpression: '#pk = :pk' + (prefix ? ' AND begins_with(#sk, :prefix)' : ''),
       ExpressionAttributeNames: { '#pk': 'pk', ...(prefix ? { '#sk': 'sk' } : {}) },
       ExpressionAttributeValues: { ':pk': pk, ...(prefix ? { ':prefix': prefix } : {}) },
       ...(after === undefined ? {} : { ExclusiveStartKey: { pk, sk: after } }),
     }));
     return { items: (result.Items ?? []).map(item => decode<T>(item)),
-      ...(result.LastEvaluatedKey ? { cursor: cursorFor(pk, prefix, result.LastEvaluatedKey.sk as string) } : {}) };
+      ...(result.LastEvaluatedKey ? { cursor: cursorFor(pk, prefix, result.LastEvaluatedKey.sk as string, order) } : {}) };
   }
   async due(now: number, limit: number): Promise<DueKey[]> {
     validateDue(now); validateLimit(limit);

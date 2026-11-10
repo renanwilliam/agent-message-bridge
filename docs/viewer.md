@@ -9,7 +9,8 @@ O tema inicial acompanha a preferência do sistema. O botão no cabeçalho alter
 - Lista por participante e ID, com busca por ID/participante; abertura por ID disponível em desktop/celular.
 - Busca literal sem distinção de maiúsculas no texto da conversa selecionada, com período de 24 horas, 7 ou 14 dias. Não é busca global nem índice full-text.
 - Cada chamada examina 30 registros por padrão, no máximo 100. Uma página vazia ainda pode ter continuação. O fim só é indicado quando não há cursor. A lista percorre uma partição de participante por chamada; o custo adicional de autorização é limitado aos candidatos dessa página.
-- A atualização consulta a partir do último registro examinado; não baixa novamente as páginas anteriores nem desloca a leitura. Se ainda houver páginas, a atualização avança uma página e informa que a consulta continua parcial. A hora exibida é a última consulta bem-sucedida, não uma garantia de atualização integral.
+- As mensagens aparecem com **mais recentes primeiro**, pela sequência de publicação da conversa. A primeira consulta já lê a página mais recente no armazenamento, sem percorrer o histórico inteiro. **Carregar mensagens anteriores** acrescenta as páginas antigas abaixo, inclusive quando os filtros produzem uma página vazia com continuação.
+- **Atualizar histórico** mantém os filtros e substitui a lista pela página mais recente; páginas antigas podem ser carregadas novamente. Uma falha mantém o conteúdo e a posição de paginação anteriores, e a tentativa seguinte repete a operação que falhou. A hora exibida é a última consulta bem-sucedida, não uma garantia de atualização integral.
 - Tokens, conteúdo, filtros e IDs de conversa não entram no endereço do navegador. Não há envio de mensagens, telemetria ou armazenamento local do histórico. O cliente remove mensagens expiradas enquanto a página está aberta e limpa conteúdo/token ao sair ou receber 401.
 - Autorização é revalidada em cada requisição. Revogação no provedor segue a semântica de validação JWT já existente; a interface não consulta o provedor continuamente nem promete revogação instantânea.
 
@@ -24,10 +25,12 @@ O tema inicial acompanha a preferência do sistema. O botão no cabeçalho alter
 Retorna `conversations` (ID, participantes, timestamp), `coverage` e `cursor` opcional. A ordem é por participante autorizado e ID; não há promessa de ordenação global por atividade. Quando ambos os participantes são autorizados, apenas o primeiro em ordem lexical emite a conversa.
 
 ```json
-{"operation":"messages","conversationId":"demo_planejamento","term":"validação","since":"2026-11-01T00:00:00.000Z","limit":30}
+{"operation":"messages","conversationId":"demo_planejamento","order":"desc","term":"validação","since":"2026-11-01T00:00:00.000Z","limit":30}
 ```
 
-Retorna `messages`, `examined`, `cursor` opcional e `resume`. `cursor` continua a página; `resume` permite consultar publicações posteriores mesmo após o fim. Os filtros e o limite devem permanecer iguais ao continuar. `until` opcional usa data ISO UTC e precisa ser posterior ou igual a `since`. A retenção de 14 dias sempre prevalece sobre os filtros.
+Retorna `messages`, `examined`, `cursor` opcional e `resume`. A opção `order` aceita `asc` ou `desc`; omitida, mantém `asc` para compatibilidade com os clientes REST anteriores. O viewer envia `desc`. A ordenação usa a chave sequencial de publicação, não um sort parcial no navegador. `cursor` continua a página na direção escolhida; `resume` marca o último registro examinado nessa mesma direção. Em `asc`, permite consultar publicações posteriores mesmo após o fim; em `desc`, continua em direção às antigas e não serve para buscar novas publicações. Para atualizar em `desc`, consultar sem cursor. Os filtros, a ordem e o limite devem permanecer iguais ao continuar. `until` opcional usa data ISO UTC e precisa ser posterior ou igual a `since`. A retenção de 14 dias sempre prevalece sobre os filtros.
+
+A ordem do catálogo de conversas, do `GET /history` e das ferramentas MCP não muda. Não há mudança de infraestrutura, índices, IAM, TTL ou credenciais: o DynamoDB usa Query reversa na mesma partição autorizada; MemoryStore e SQLite mantêm o mesmo comportamento nos testes locais.
 
 Cursores são opacos para o cliente, vinculados ao tenant, identidade, scopes, participantes e filtros. Não são credenciais: uma posição manipulada não substitui a autorização e a consulta permanece limitada à partição autorizada. Termos/corpos e tokens não devem ser adicionados a access logs, traces ou telemetria. O template continua sem logging de corpos da API.
 

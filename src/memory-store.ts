@@ -1,4 +1,4 @@
-import { Conflict, type DueKey, type Key, type Page, type Row, type Store, type Write } from './store.js';
+import { Conflict, type DueKey, type Key, type Page, type QueryOrder, type Row, type Store, type Write } from './store.js';
 import { clone, compareKeys, cursorFor, keyId, nextRow, readCursor, validateDue, validateKey, validateLimit, validateQuery, validateWrites } from './store-utils.js';
 
 /** Test/local ephemeral implementation. Every commit runs without an async yield. */
@@ -9,13 +9,14 @@ export class MemoryStore implements Store {
     const row = this.rows.get(keyId(key));
     return row ? clone(row) as Row<T> : undefined;
   }
-  async query<T = Record<string, unknown>>(pk: string, prefix: string, limit: number, cursor?: string): Promise<Page<T>> {
-    validateQuery(pk, prefix, limit);
-    const after = readCursor(cursor, pk, prefix);
+  async query<T = Record<string, unknown>>(pk: string, prefix: string, limit: number, cursor?: string, order: QueryOrder = 'asc'): Promise<Page<T>> {
+    validateQuery(pk, prefix, limit, order);
+    const after = readCursor(cursor, pk, prefix, order);
+    const direction = order === 'asc' ? 1 : -1;
     const matches = [...this.rows.values()].filter(row => row.pk === pk && row.sk.startsWith(prefix) &&
-      (after === undefined || compareKeys(row.sk, after) > 0)).sort((a, b) => compareKeys(a.sk, b.sk));
+      (after === undefined || direction * compareKeys(row.sk, after) > 0)).sort((a, b) => direction * compareKeys(a.sk, b.sk));
     const items = matches.slice(0, limit).map(row => clone(row) as Row<T>);
-    return { items, ...(matches.length > limit ? { cursor: cursorFor(pk, prefix, items.at(-1)!.sk) } : {}) };
+    return { items, ...(matches.length > limit ? { cursor: cursorFor(pk, prefix, items.at(-1)!.sk, order) } : {}) };
   }
   async due(now: number, limit: number): Promise<DueKey[]> {
     validateDue(now); validateLimit(limit);

@@ -1,4 +1,4 @@
-import type { Key, Row, Write } from './store.js';
+import type { Key, QueryOrder, Row, Write } from './store.js';
 
 export function keyId(key: Key): string { return JSON.stringify([key.pk, key.sk]); }
 export function validateKey(key: Key): void {
@@ -12,21 +12,23 @@ export function validateLimit(limit: number): void {
 export function validateDue(now: number): void {
   if (!Number.isSafeInteger(now) || now < 0) throw new Error('Invalid due timestamp');
 }
-export function validateQuery(pk: string, prefix: string, limit: number): void {
+export function validateQuery(pk: string, prefix: string, limit: number, order: QueryOrder = 'asc'): void {
   validateKey({ pk, sk: prefix || '_' });
   validateLimit(limit);
+  if (order !== 'asc' && order !== 'desc') throw new Error('Invalid query order');
 }
-export function cursorFor(pk: string, prefix: string, sk: string): string {
-  return Buffer.from(JSON.stringify({ v: 1, pk, prefix, sk })).toString('base64url');
+export function cursorFor(pk: string, prefix: string, sk: string, order: QueryOrder = 'asc'): string {
+  return Buffer.from(JSON.stringify(order === 'asc' ? { v: 1, pk, prefix, sk } : { v: 2, pk, prefix, sk, order })).toString('base64url');
 }
-export function readCursor(cursor: string | undefined, pk: string, prefix: string): string | undefined {
+export function readCursor(cursor: string | undefined, pk: string, prefix: string, order: QueryOrder = 'asc'): string | undefined {
   if (cursor === undefined) return undefined;
   try {
     if (!cursor || cursor.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
     const parsed: unknown = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
     if (!parsed || typeof parsed !== 'object') throw new Error();
     const item = parsed as Record<string, unknown>;
-    if (Object.keys(item).length !== 4 || item.v !== 1 || item.pk !== pk || item.prefix !== prefix ||
+    const validOrder = order === 'asc' ? Object.keys(item).length === 4 && item.v === 1 : Object.keys(item).length === 5 && item.v === 2 && item.order === order;
+    if (!validOrder || item.pk !== pk || item.prefix !== prefix ||
         typeof item.sk !== 'string' || !item.sk.startsWith(prefix)) throw new Error();
     validateKey({ pk, sk: item.sk });
     return item.sk;

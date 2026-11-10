@@ -13,7 +13,6 @@ import {
   LogOut,
   Menu,
   ChevronDown,
-  ArrowDown,
   MessageSquare,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -265,21 +264,20 @@ function Messages({
   now: number;
 }) {
   const [rows, setRows] = useState<Message[]>([]),
-    [cursor, setCursor] = useState<string>(),
-    [resume, setResume] = useState<string>();
+    [cursor, setCursor] = useState<string>();
   const [busy, setBusy] = useState(false),
     [loaded, setLoaded] = useState(false),
     [error, setError] = useState(''),
     [updated, setUpdated] = useState<string>();
-  const [notice, setNotice] = useState(''),
-    [firstNew, setFirstNew] = useState<string>();
+  const [notice, setNotice] = useState('');
   const gate = useRef(false),
     controller = useRef<AbortController | null>(null),
     active = useRef(true);
-  const nodes = useRef(new Map<string, HTMLElement>());
+  const lastRefresh = useRef(false);
   async function load(refresh = false) {
     if (gate.current) return;
     gate.current = true;
+    lastRefresh.current = refresh;
     setBusy(true);
     setError('');
     const abort = new AbortController();
@@ -288,33 +286,32 @@ function Messages({
       const result = await query<{
         messages: Message[];
         cursor?: string;
-        resume: string;
       }>(
         {
           operation: 'messages',
           conversationId,
           term,
           since,
-          cursor: refresh ? resume : cursor,
+          order: 'desc',
+          cursor: refresh ? undefined : cursor,
         },
         abort.signal,
       );
       if (!active.current || abort.signal.aborted) return;
-      const known = new Set(rows.map(messageKey));
-      const added = result.messages.filter((m) => !known.has(messageKey(m)));
       setRows((previous) => [
         ...new Map(
-          [...previous, ...result.messages].map((m) => [messageKey(m), m]),
+          [...(refresh ? [] : previous), ...result.messages].map((m) => [
+            messageKey(m),
+            m,
+          ]),
         ).values(),
       ]);
       setCursor(result.cursor);
-      setResume(result.resume);
       setLoaded(true);
       setUpdated(new Date().toISOString());
       setNotice(
-        `${added.length} mensagem(ns) carregada(s). ${result.cursor ? 'Há mais páginas.' : 'Fim do histórico disponível.'}`,
+        `${result.messages.length} mensagem(ns) carregada(s). ${result.cursor ? 'Há mais páginas.' : 'Fim do histórico disponível.'}`,
       );
-      if (refresh && added.length) setFirstNew(messageKey(added[0]));
     } catch (e) {
       if (active.current && !abort.signal.aborted)
         setError(e instanceof Error ? e.message : 'Erro de rede.');
@@ -333,7 +330,7 @@ function Messages({
       controller.current?.abort();
     };
   }, []);
-  // A posição é preservada ao anexar páginas. O salto só ocorre por ação explícita.
+  // Páginas anteriores são anexadas; atualizar volta à página mais recente.
   const retained = rows.filter((m) => visible(m.timestamp, now));
   useEffect(() => {
     setRows((previous) => previous.filter((m) => visible(m.timestamp, now)));
@@ -367,35 +364,20 @@ function Messages({
         </div>
       </header>
       <p className="text-xs text-muted-foreground">
-        Ordem cronológica · {Intl.DateTimeFormat().resolvedOptions().timeZone} ·
+        Mais recentes primeiro · {Intl.DateTimeFormat().resolvedOptions().timeZone} ·
         até 30 registros examinados por consulta
       </p>
       <p role="status" className="text-sm text-muted-foreground">
         {notice}
       </p>
-      {firstNew && nodes.current.has(firstNew) && (
-        <Button
-          variant="secondary"
-          onClick={() => {
-            nodes.current.get(firstNew)?.focus();
-            nodes.current.get(firstNew)?.scrollIntoView({ block: 'center' });
-            setFirstNew(undefined);
-          }}
-        >
-          <ArrowDown data-icon="inline-start" />
-          Ir para mensagens novas
-        </Button>
+      {error && (
+        <Failure message={error} retry={() => void load(lastRefresh.current)} />
       )}
-      {error && <Failure message={error} retry={() => void load(loaded)} />}
       {busy && !loaded && <Loading />}
       {retained.map((m) => (
         <article
           key={messageKey(m)}
           tabIndex={-1}
-          ref={(node) => {
-            if (node) nodes.current.set(messageKey(m), node);
-            else nodes.current.delete(messageKey(m));
-          }}
           className="rounded-xl border bg-card p-5 text-card-foreground outline-offset-4"
         >
           <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
@@ -450,7 +432,7 @@ function Messages({
       )}
       {cursor ? (
         <Button variant="outline" disabled={busy} onClick={() => void load()}>
-          {busy && <Spinner />}Carregar mais mensagens
+          {busy && <Spinner />}Carregar mensagens anteriores
         </Button>
       ) : (
         loaded && (

@@ -62,6 +62,28 @@ for (const kind of ['memory', 'sqlite']) {
     } finally { close(); }
   });
 
+  test(`${kind}: reverse pagination is bounded, direction-scoped and stable across insertions`, async () => {
+    const { store, close } = fixture(kind);
+    try {
+      await store.commit(['other', 'message#001', 'message#002', 'message#003', 'message#004'].map(sk =>
+        ({ pk: 'tenant', sk, expected: null, value: { sk } })));
+      const first = await store.query('tenant', 'message#', 2, undefined, 'desc');
+      assert.deepEqual(first.items.map(item => item.sk), ['message#004', 'message#003']);
+      assert.ok(first.cursor);
+      await store.commit([{ pk: 'tenant', sk: 'message#005', expected: null, value: {} }]);
+      const second = await store.query('tenant', 'message#', 2, first.cursor, 'desc');
+      assert.deepEqual(second.items.map(item => item.sk), ['message#002', 'message#001']);
+      assert.equal(second.cursor, undefined);
+      assert.equal((await store.query('tenant', 'message#', 2, undefined, 'desc')).items[0]?.sk, 'message#005');
+      await assert.rejects(store.query('tenant', 'message#', 2, first.cursor), /cursor/);
+      const ascending = await store.query('tenant', 'message#', 2);
+      await assert.rejects(store.query('tenant', 'message#', 2, ascending.cursor, 'desc'), /cursor/);
+      await assert.rejects(store.query('other-tenant', 'message#', 2, first.cursor, 'desc'), /cursor/);
+      await assert.rejects(store.query('tenant', 'other', 2, first.cursor, 'desc'), /cursor/);
+      await assert.rejects(store.query('tenant', 'message#', 2, undefined, 'invalid' as any), /order/);
+    } finally { close(); }
+  });
+
   test(`${kind}: due selection is bounded, ordered and removes completed rows`, async () => {
     const { store, close } = fixture(kind);
     try {
@@ -198,6 +220,26 @@ test('DynamoDB translates only CAS cancellation into Conflict and leaves availab
   await assert.rejects(store.commit(write), error => error === failure);
   failure = { name: 'TransactionCanceledException', CancellationReasons: [{ Code: 'ProvisionedThroughputExceeded' }] };
   await assert.rejects(store.commit(write), error => error === failure);
+});
+test('DynamoDB reverse history uses one bounded Query per page and direction-scoped cursors', async () => {
+  const inputs: Record<string, unknown>[] = [];
+  const client = { send: async (command: { input: Record<string, unknown> }) => {
+    inputs.push(command.input);
+    return { Items: [], ...(inputs.length === 1 ? { LastEvaluatedKey: { pk: 'tenant', sk: 'message#003' } } : {}) };
+  } } as unknown as Pick<DynamoDBDocumentClient, 'send'>;
+  const store = new DynamoStore('fixture-table', client);
+  const first = await store.query('tenant', 'message#', 2, undefined, 'desc');
+  assert.ok(first.cursor);
+  await store.query('tenant', 'message#', 2, first.cursor, 'desc');
+  for (const input of inputs) {
+    assert.equal(input.ScanIndexForward, false);
+    assert.equal(input.Limit, 2);
+    assert.equal(input.ConsistentRead, true);
+    assert.equal(input.KeyConditionExpression, '#pk = :pk AND begins_with(#sk, :prefix)');
+  }
+  assert.deepEqual(inputs[1]!.ExclusiveStartKey, { pk: 'tenant', sk: 'message#003' });
+  await assert.rejects(store.query('tenant', 'message#', 2, first.cursor), /cursor/);
+  assert.equal(inputs.length, 2);
 });
 
 
